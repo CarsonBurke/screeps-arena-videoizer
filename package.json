@@ -1,0 +1,11 @@
+{
+  "name": "screeps-arena-videoizer",
+  "version": "1.0.0",
+  "description": "Board-only Screeps Arena replay recorder for the Steam/Electron client.",
+  "license": "ISC",
+  "type": "commonjs",
+  "scripts": {
+    "check": "bash -n record-board-x11.sh && node --check patch-screeps-arena.js"
+  }
+}
+
