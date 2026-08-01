@@ -4,9 +4,39 @@
 const fs = require("fs");
 const path = require("path");
 
-const appRoot = process.env.SCA_APP_ROOT ||
-  "/home/marvin/.local/share/Steam/steamapps/common/ScreepsArena";
+const appCandidates = [
+  process.env.SCA_APP_ROOT,
+  path.join(
+    process.env.HOME || "",
+    ".local/share/Steam/steamapps/common/ScreepsArena",
+  ),
+  path.join(
+    process.env.HOME || "",
+    ".var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/common/ScreepsArena",
+  ),
+].filter(Boolean);
+const appRoot = appCandidates.find((candidate) =>
+  fs.existsSync(path.join(candidate, "resources", "app", "dist")),
+) || appCandidates[0];
 const dist = path.join(appRoot, "resources", "app", "dist");
+const runtimeDir = path.join(dist, "screeps-arena-videoizer");
+const projectDir = __dirname;
+const runtimeNames = [
+  "board-framing.js",
+  "capture-config.js",
+  "capture-rng.js",
+  "capture-scene.js",
+  "capture-transport.js",
+  "capture-board-runtime.js",
+  "renderer-actions.js",
+  "renderer-calculations.js",
+  "renderer-expressions.js",
+  "renderer-processors.js",
+  "renderer-random.js",
+  "replay-batches.js",
+  "replay-ir.js",
+  "virtual-timeline.js",
+];
 
 const files = {
   index: path.join(dist, "index.js"),
@@ -20,19 +50,24 @@ for (const file of Object.values(files)) {
   }
 }
 
-function backup(file) {
+function prepareBase(file, marker) {
   const backupFile = `${file}.videoizer.bak`;
-  if (!fs.existsSync(backupFile)) {
+  const content = read(file);
+  if (!content.includes(marker)) {
+    // A clean current bundle is authoritative. Refresh an older backup after a
+    // Steam update instead of later rolling the installation back to that
+    // obsolete version.
     fs.copyFileSync(file, backupFile);
+    return content;
   }
+  if (!fs.existsSync(backupFile)) {
+    throw new Error(`Patched bundle has no pristine backup: ${file}`);
+  }
+  return read(backupFile);
 }
 
 function read(file) {
   return fs.readFileSync(file, "utf8");
-}
-
-function write(file, content) {
-  fs.writeFileSync(file, content);
 }
 
 function replaceOnce(content, from, to, label, done = to) {
@@ -53,20 +88,12 @@ function replaceAll(content, from, to, label, done = to) {
 
 function patchIndex() {
   const file = files.index;
-  backup(file);
-  let content = read(file);
-
-  content = replaceOnce(
-    content,
-    'var path = __webpack_require__(/*! path */ "path");\nvar electron_1 = __webpack_require__(/*! electron */ "electron");',
-    'var path = __webpack_require__(/*! path */ "path");\nvar fs = __webpack_require__(/*! fs */ "fs");\nvar electron_1 = __webpack_require__(/*! electron */ "electron");',
-    "index fs import",
-  );
+  let content = prepareBase(file, "boardCaptureWindow");
 
   content = replaceOnce(
     content,
     '    console.log(123.1, scaleFactor, width, height, other);\n    var zoomFactor = 1;',
-    "    console.log(123.1, scaleFactor, width, height, other);\n    var boardCaptureWindow = !!process.env.SCREEPS_ARENA_BOARD_CAPTURE || process.argv.some(function (arg) { return String(arg).indexOf('board-capture=true') !== -1; }) || fs.existsSync('/tmp/screeps-arena-board-capture');\n    var zoomFactor = 1;",
+    "    console.log(123.1, scaleFactor, width, height, other);\n    var boardCaptureWindow = !!process.env.SCREEPS_ARENA_BOARD_CAPTURE || process.argv.some(function (arg) { return String(arg).indexOf('board-capture=true') !== -1; });\n    var zoomFactor = 1;",
     "index board-capture flag",
   );
 
@@ -106,13 +133,12 @@ function patchIndex() {
     "index Discord RPC flag",
   );
 
-  write(file, content);
+  return { file, content };
 }
 
 function patchMain() {
   const file = files.main;
-  backup(file);
-  let content = read(file);
+  let content = prepareBase(file, "screeps-board-capture");
 
   content = replaceOnce(
     content,
@@ -131,6 +157,40 @@ function patchMain() {
     }
 
     this.boardCapture = boardCaptureParams?.get('board-capture') === 'true' || !!boardCaptureEnv?.SCREEPS_ARENA_BOARD_CAPTURE;
+    if (this.boardCapture && typeof globalThis !== 'undefined') {
+      // Seed before Angular creates the child renderer. Metadata actions use
+      // Math.random during scene construction; seeding later would leave the
+      // initial scene nondeterministic even if subsequent replay objects were
+      // deterministic.
+      const boardCaptureRandomSeed = String(
+        boardCaptureParams?.get('capture-random-seed')
+          || boardCaptureEnv?.SCREEPS_ARENA_BOARD_CAPTURE_RANDOM_SEED
+          || (typeof location !== 'undefined' ? location.hash.split('?')[0] : '')
+          || 'screeps-arena-videoizer'
+      );
+      let boardCaptureSeedHash = 2166136261;
+      for (const character of boardCaptureRandomSeed) {
+        boardCaptureSeedHash ^= character.codePointAt(0);
+        boardCaptureSeedHash = Math.imul(boardCaptureSeedHash, 16777619);
+      }
+      globalThis.__screepsArenaVideoizerRandomState = boardCaptureSeedHash >>> 0;
+      if (!globalThis.__screepsArenaVideoizerOriginalRandom) {
+        globalThis.__screepsArenaVideoizerOriginalRandom = Math.random;
+      }
+      globalThis.__screepsArenaVideoizerRandomSeed = boardCaptureRandomSeed;
+      Math.random = () => {
+        const boardCaptureRandomState = (
+          globalThis.__screepsArenaVideoizerRandomState + 0x6D2B79F5
+        ) | 0;
+        globalThis.__screepsArenaVideoizerRandomState = boardCaptureRandomState;
+        let value = Math.imul(
+          boardCaptureRandomState ^ boardCaptureRandomState >>> 15,
+          1 | boardCaptureRandomState
+        );
+        value ^= value + Math.imul(value ^ value >>> 7, 61 | value);
+        return ((value ^ value >>> 14) >>> 0) / 4294967296;
+      };
+    }
     // Tag the document so the viewport/resize/centering overrides apply. This
     // must run in *this* (replay) component's constructor — before the child
     // renderer initializes — so the class is present when it reads the capture
@@ -139,7 +199,31 @@ function patchMain() {
       document.documentElement.classList.add('screeps-board-capture');
       document.body?.classList.add('screeps-board-capture');
     }
-    this.zoomLevel = this.boardCapture ? Number(boardCaptureParams?.get('board-zoom') || boardCaptureEnv?.SCREEPS_ARENA_BOARD_CAPTURE_ZOOM || 0.168) : 0.06;
+    const boardCaptureZoom = boardCaptureParams?.get('board-zoom') || boardCaptureEnv?.SCREEPS_ARENA_BOARD_CAPTURE_ZOOM || 'auto';
+    const boardCaptureNumericZoom = Number(boardCaptureZoom);
+    if (this.boardCapture) {
+      // Terrain is rasterized into this intermediate texture before the stage
+      // is sampled at capture resolution. Keep it at least as detailed as the
+      // projected board (within a conservative WebGL texture limit) to avoid
+      // magnifying the old low-resolution terrain surface.
+      const boardCaptureWidth = Number(boardCaptureParams?.get('capture-width') || boardCaptureEnv?.SCREEPS_ARENA_BOARD_CAPTURE_WIDTH) || 2048;
+      const boardCaptureHeight = Number(boardCaptureParams?.get('capture-height') || boardCaptureEnv?.SCREEPS_ARENA_BOARD_CAPTURE_HEIGHT) || 2048;
+      const boardCapturePadding = Number(boardCaptureParams?.get('board-padding') || boardCaptureEnv?.SCREEPS_ARENA_BOARD_CAPTURE_PADDING) || 0;
+      const projectedBoardSize = Number.isFinite(boardCaptureNumericZoom) && boardCaptureNumericZoom > 0
+        ? Math.ceil(this.worldConfig.VIEW_BOX * boardCaptureNumericZoom)
+        : Math.max(1, Math.min(boardCaptureWidth, boardCaptureHeight) - 2 * boardCapturePadding);
+      const requestedTextureSize = Number(boardCaptureParams?.get('capture-texture-size') || boardCaptureEnv?.SCREEPS_ARENA_BOARD_CAPTURE_TEXTURE_SIZE);
+      const boardCaptureTextureSize = Number.isFinite(requestedTextureSize) && requestedTextureSize > 0
+        ? Math.floor(requestedTextureSize)
+        : Math.min(4096, Math.max(2048, Math.ceil(projectedBoardSize)));
+      this.worldConfig.RENDER_SIZE = { width: boardCaptureTextureSize, height: boardCaptureTextureSize };
+    }
+    // "auto" framing needs the mounted renderer's true viewport and world
+    // dimensions. Seed child initialization with a harmless finite value; the
+    // capture runtime installs the exact auto-fit transform before frame zero.
+    this.zoomLevel = this.boardCapture && Number.isFinite(boardCaptureNumericZoom) && boardCaptureNumericZoom > 0
+      ? boardCaptureNumericZoom
+      : 0.06;
     this.cell$ = new rxjs__WEBPACK_IMPORTED_MODULE_35__.BehaviorSubject(null);`,
     "main replay board-capture constructor",
     "document.documentElement.classList.add('screeps-board-capture');",
@@ -163,8 +247,9 @@ function patchMain() {
         // full board at full resolution regardless. Fall back to the window
         // size when no explicit capture size is set.
         var __capEnv = (typeof process !== 'undefined' && process.env) ? process.env : {};
-        var __capW = Number(__capEnv.SCREEPS_ARENA_BOARD_CAPTURE_WIDTH) || 0;
-        var __capH = Number(__capEnv.SCREEPS_ARENA_BOARD_CAPTURE_HEIGHT) || 0;
+        var __capParams = new URLSearchParams((location.hash.split('?')[1] || location.search || ''));
+        var __capW = Number(__capParams.get('capture-width') || __capEnv.SCREEPS_ARENA_BOARD_CAPTURE_WIDTH) || 0;
+        var __capH = Number(__capParams.get('capture-height') || __capEnv.SCREEPS_ARENA_BOARD_CAPTURE_HEIGHT) || 0;
         width = __capW > 0 ? __capW : window.innerWidth;
         height = __capH > 0 ? __capH : window.innerHeight;
       }`,
@@ -185,8 +270,9 @@ function patchMain() {
           // Fixed capture viewport, independent of the WM window size (see the
           // matching note on the other viewport site).
           var __capEnv = (typeof process !== 'undefined' && process.env) ? process.env : {};
-          var __capW = Number(__capEnv.SCREEPS_ARENA_BOARD_CAPTURE_WIDTH) || 0;
-          var __capH = Number(__capEnv.SCREEPS_ARENA_BOARD_CAPTURE_HEIGHT) || 0;
+          var __capParams = new URLSearchParams((location.hash.split('?')[1] || location.search || ''));
+          var __capW = Number(__capParams.get('capture-width') || __capEnv.SCREEPS_ARENA_BOARD_CAPTURE_WIDTH) || 0;
+          var __capH = Number(__capParams.get('capture-height') || __capEnv.SCREEPS_ARENA_BOARD_CAPTURE_HEIGHT) || 0;
           width = __capW > 0 ? __capW : window.innerWidth;
           height = __capH > 0 ? __capH : window.innerHeight;
         }`,
@@ -235,8 +321,9 @@ function patchMain() {
       // runs at init (and on window changes); without the override it clobbers
       // the buffer back to the WM-assigned window size, breaking framing/res.
       var __capEnv = (typeof process !== 'undefined' && process.env) ? process.env : {};
-      var __capW = Number(__capEnv.SCREEPS_ARENA_BOARD_CAPTURE_WIDTH) || 0;
-      var __capH = Number(__capEnv.SCREEPS_ARENA_BOARD_CAPTURE_HEIGHT) || 0;
+      var __capParams = new URLSearchParams((location.hash.split('?')[1] || location.search || ''));
+      var __capW = Number(__capParams.get('capture-width') || __capEnv.SCREEPS_ARENA_BOARD_CAPTURE_WIDTH) || 0;
+      var __capH = Number(__capParams.get('capture-height') || __capEnv.SCREEPS_ARENA_BOARD_CAPTURE_HEIGHT) || 0;
       width = __capW > 0 ? __capW : window.innerWidth;
       height = __capH > 0 ? __capH : window.innerHeight;
     }
@@ -276,239 +363,74 @@ function patchMain() {
     if (!rendererRef) { return; }
     var mountedSub = rendererRef.mounted$.subscribe(function (mounted) {
       if (!mounted) { return; }
-      mountedSub.unsubscribe();
-      var start = function () { self._runBoardCapture(); };
-      if (self.ticks$.getValue() >= 1) { start(); return; }
-      var ticksSub = self.ticks$.subscribe(function (ticks) {
-        if (ticks >= 1) { ticksSub.unsubscribe(); start(); }
-      });
+      if (mountedSub) { mountedSub.unsubscribe(); }
+      else { setTimeout(function () { mountedSub?.unsubscribe(); }, 0); }
+      var started = false;
+      var readyTimer = null;
+      var ticksSub = null;
+      var startWhenReady = function () {
+        var replayTicks = self._scaReplayStateService?._game?.game?.meta?.ticks;
+        var ticksValue = self.ticks$.getValue();
+        var metadataReady = Number.isSafeInteger(replayTicks) && replayTicks >= 0;
+        // Prefer authoritative meta.ticks, but wait until ticks$ agrees so
+        // capture never starts with a stale zero length while meta is ready.
+        // Also wait past the default double-zero (meta and ticks both still 0)
+        // until the replay service has a game object, so empty placeholders do
+        // not encode a one-frame "success".
+        if (started) { return; }
+        var hasGame = !!self._scaReplayStateService?._game;
+        if (metadataReady) {
+          if (ticksValue !== replayTicks) { return; }
+          if (replayTicks === 0 && !hasGame) { return; }
+        } else if (!(Number.isSafeInteger(ticksValue) && ticksValue >= 0) || ticksValue < 1) {
+          return;
+        }
+        started = true;
+        if (readyTimer) { clearInterval(readyTimer); }
+        if (ticksSub) { ticksSub.unsubscribe(); }
+        self._runBoardCapture(metadataReady ? replayTicks : ticksValue);
+      };
+      // BehaviorSubject emits synchronously during subscribe(), before the
+      // subscription variable is assigned. Defer the readiness check so cleanup
+      // can always unsubscribe safely.
+      ticksSub = self.ticks$.subscribe(function () { setTimeout(startWhenReady, 0); });
+      readyTimer = setInterval(startWhenReady, 25);
+      startWhenReady();
     });
   }
 
-  _runBoardCapture() {
-    var self = this;
-    var fs = require('fs');
-    var env = (typeof process !== 'undefined' && process.env) ? process.env : {};
-    // The app renders inside Steam's pressure-vessel container, where the host
-    // ffmpeg is not reachable. So we encode H.264 in-process (WebCodecs) and
-    // stream the Annex-B elementary stream to a FIFO that the host opened (under
-    // the output dir, which is bind-mounted into the container); the host just
-    // remuxes it to MP4 with ffmpeg -c copy.
-    var fifoPath = env.SCREEPS_ARENA_BOARD_CAPTURE_FIFO;
-    if (!fifoPath) { return; }
-    var metaPath = env.SCREEPS_ARENA_BOARD_CAPTURE_META || (fifoPath + '.meta');
-    var fps = Number(env.SCREEPS_ARENA_BOARD_CAPTURE_FPS) || 30;
-    var framesPerTick = Number(env.SCREEPS_ARENA_BOARD_CAPTURE_FRAMES_PER_TICK) || 8;
-    var doneFile = env.SCREEPS_ARENA_BOARD_CAPTURE_DONE || '/tmp/screeps-arena-capture-done';
-    var errFile = env.SCREEPS_ARENA_BOARD_CAPTURE_ERROR || '/tmp/screeps-arena-capture-error';
-    var fail = function (msg) { try { fs.writeFileSync(errFile, String(msg)); } catch (e) {} };
-    var dbgFile = env.SCREEPS_ARENA_BOARD_CAPTURE_DEBUG || '/tmp/sca-capture-debug.log';
-    var dlog = function (msg) { try { fs.appendFileSync(dbgFile, '[' + Date.now() + '] ' + msg + '\\n'); } catch (e) {} };
-    dlog('runBoardCapture: start');
-
-    var gameApp = self.screepsRendererRef && self.screepsRendererRef._gameApp;
-    if (!gameApp || !gameApp.app) { fail('board capture: renderer app unavailable'); return; }
-    var app = gameApp.app;
-    var renderer = app.renderer;
-    var stage = app.stage;
-    dlog('internals: getTick=' + (self._scaReplayStateService && typeof self._scaReplayStateService.getTick) + ' applyState=' + (typeof self.screepsRendererRef.applyState) + ' actionManager.update=' + (gameApp.actionManager && typeof gameApp.actionManager.update));
-    var canvas = renderer.view || (renderer.context && renderer.context.canvas) || (renderer.gl && renderer.gl.canvas);
-    if (typeof VideoEncoder === 'undefined' || typeof VideoFrame === 'undefined' || !canvas) {
-      fail('board capture: WebCodecs (VideoEncoder/VideoFrame) or renderer canvas unavailable in this Electron');
-      return;
-    }
-    var deltaSec = 1 / fps;
-    var tickDurationSec = framesPerTick / fps;
-
-    // Take deterministic control of the clock: no RAF loop, no Date.now-driven animate.
-    try { app.ticker.autoStart = false; app.ticker.stop(); } catch (e) {}
-    try { clearTimeout(gameApp.animateCheckerTimer); } catch (e) {}
-    // Opaque background so extracted frames match the previous x11grab output.
-    try { renderer.background.color = 0x191B21; renderer.background.alpha = 1; } catch (e) {}
-
-    self.play = false;
-    self._tickRate = tickDurationSec;
-
-    var width = renderer.width;
-    var height = renderer.height;
-    var totalTicks = self.ticks$.getValue();
-    if (!(totalTicks >= 1) || !(width >= 1) || !(height >= 1)) {
-      fail('board capture: invalid geometry/ticks (' + width + 'x' + height + ', ticks=' + totalTicks + ')');
-      return;
-    }
-    dlog('geometry: renderer ' + width + 'x' + height + ' screen=' + (renderer.screen && renderer.screen.width) + 'x' + (renderer.screen && renderer.screen.height) + ' res=' + renderer.resolution + ' envW=' + env.SCREEPS_ARENA_BOARD_CAPTURE_WIDTH + ' envH=' + env.SCREEPS_ARENA_BOARD_CAPTURE_HEIGHT + ' totalTicks=' + totalTicks);
-    // Report the actual WebGL backend so we can tell hardware (NVIDIA/...) from
-    // software (SwiftShader) rendering, which dominates capture throughput.
-    try {
-      var gl = renderer.gl || (renderer.context && renderer.context.gl);
-      if (gl) {
-        var __dbgInfo = gl.getExtension('WEBGL_debug_renderer_info');
-        dlog('gl: type=' + renderer.type + ' RENDERER=' + gl.getParameter(gl.RENDERER) + ' VENDOR=' + gl.getParameter(gl.VENDOR) + (__dbgInfo ? ' UNMASKED=' + gl.getParameter(__dbgInfo.UNMASKED_RENDERER_WEBGL) : ''));
-      } else { dlog('gl: context unavailable (renderer.type=' + renderer.type + ')'); }
-    } catch (e) { dlog('gl: error ' + (e && e.message || e)); }
-
-    // Each tick is rendered to the canvas and encoded in-process with WebCodecs:
-    // VideoFrame(canvas) keeps the frame on the GPU (~free) and the H.264 encoder
-    // emits an Annex-B elementary stream, so we never pay the gl.readPixels CPU
-    // readback (~1-2s/frame) that bottlenecked the previous approach. The FIFO,
-    // meta sidecar and encoder are set up in the capture loop below, after the
-    // player mapper is ready and a supported encoder config has been chosen.
-
-    // Fetch each tick's replay state directly and apply it, reproducing the
-    // per-player object remapping the live RxJS pipeline does (object _id/user
-    // rewritten to player hashes, plus the users map). Driving applyState
-    // ourselves is deterministic and surfaces fetch errors directly, instead of
-    // depending on the tick$ -> getTick -> _state$ pipeline whose catchError
-    // silently swallows a slow/failed per-chunk fetch (which stalled capture).
-    var stateService = self._scaReplayStateService;
-    var applyTick = function (tick) {
-      if (tick <= 3) dlog('applyTick ' + tick + ': getTick start');
-      var fetched = Promise.resolve(stateService.getTick(tick));
-      var timed = new Promise(function (_, reject) {
-        setTimeout(function () { reject(new Error('board capture: getTick(' + tick + ') timed out after 20s')); }, 20000);
-      });
-      return Promise.race([fetched, timed]).then(function (state) {
-        if (!state || !Array.isArray(state.objects)) {
-          throw new Error('board capture: no state for tick ' + tick);
-        }
-        if (tick <= 3) dlog('applyTick ' + tick + ': getTick ok, objects=' + state.objects.length);
-        var mapper = self._boardCaptureMapper;
-        var mapped = mapper
-          ? Object.assign({}, state, { objects: state.objects.map(mapper.mapStateObject), users: mapper.users })
-          : state;
-        self.screepsRendererRef.applyState(mapped, tickDurationSec);
-        if (tick <= 3) dlog('applyTick ' + tick + ': applyState done');
-      });
-    };
-
-    // The player hashes / object mapper are built by the replay state pipeline
-    // once the players resolve (shortly after mount). Wait for it so the state
-    // we apply directly matches what the renderer expects.
-    var waitForMapper = function () {
-      return new Promise(function (resolve, reject) {
-        var waited = 0;
-        var poll = function () {
-          if (self._boardCaptureMapper) { resolve(); return; }
-          waited += 50;
-          if (waited > 30000) { reject(new Error('board capture: player object mapper not ready')); return; }
-          setTimeout(poll, 50);
-        };
-        poll();
-      });
-    };
-
-    (async function () {
-      var stream = null;
-      try {
-        await waitForMapper();
-
-        // Pick a supported H.264 config: prefer hardware, fall back to software.
-        // realtime latency mode avoids B-frames so the Annex-B stream is in
-        // display order and the host can mux it straight through (ffmpeg -c copy).
-        var bitrate = Number(env.SCREEPS_ARENA_BOARD_CAPTURE_BITRATE) || 16000000;
-        var keyint = Math.max(1, Math.round(fps * 2));
-        var cands = [
-          { codec: 'avc1.640033', hardwareAcceleration: 'prefer-hardware' },
-          { codec: 'avc1.640033', hardwareAcceleration: 'no-preference' },
-          { codec: 'avc1.42E033', hardwareAcceleration: 'no-preference' }
-        ];
-        var chosen = null;
-        for (var ci = 0; ci < cands.length; ci++) {
-          var cfg = { codec: cands[ci].codec, width: width, height: height, bitrate: bitrate, framerate: fps, latencyMode: 'realtime', avc: { format: 'annexb' }, hardwareAcceleration: cands[ci].hardwareAcceleration };
-          var sup = null; try { sup = await VideoEncoder.isConfigSupported(cfg); } catch (e) {}
-          if (sup && sup.supported) { chosen = cfg; break; }
-        }
-        if (!chosen) { throw new Error('no supported H.264 encoder config for ' + width + 'x' + height); }
-        dlog('encoder: ' + chosen.codec + ' hw=' + chosen.hardwareAcceleration + ' bitrate=' + bitrate + ' keyint=' + keyint);
-
-        // Announce geometry + fps, then open the FIFO (blocks in the threadpool
-        // until the host ffmpeg reader attaches). The FIFO carries the H.264
-        // Annex-B elementary stream the encoder emits, not raw frames.
-        try { fs.writeFileSync(metaPath, width + ' ' + height + ' ' + fps + '\\n'); } catch (e) { throw new Error('cannot write meta: ' + e); }
-        stream = fs.createWriteStream(fifoPath);
-        var streamErr = null;
-        stream.on('error', function (err) { streamErr = streamErr || err; });
-        // Encoded chunks are tiny vs raw frames so the FIFO rarely backs up, but
-        // honour write backpressure anyway to bound memory.
-        var draining = null;
-        var writeChunk = function (buf) {
-          if (streamErr) { throw streamErr; }
-          if (!stream.write(buf) && !draining) {
-            draining = new Promise(function (res) { stream.once('drain', function () { draining = null; res(); }); });
-          }
-        };
-
-        var encErr = null, encoded = 0;
-        var encoder = new VideoEncoder({
-          output: function (chunk) { encoded++; var b = new Uint8Array(chunk.byteLength); chunk.copyTo(b); try { writeChunk(Buffer.from(b)); } catch (e) { encErr = encErr || e; } },
-          error: function (e) { encErr = encErr || e; }
-        });
-        encoder.configure(chosen);
-
-        dlog('mapper ready; encoding ' + (totalTicks + 1) + ' ticks at ' + width + 'x' + height + ' (' + framesPerTick + ' frames/tick @' + fps + 'fps)');
-        var globalFrame = 0;
-        for (var tick = 0; tick <= totalTicks; tick++) {
-          await applyTick(tick);
-          var frames = tick === 0 ? 1 : framesPerTick;
-          for (var f = 0; f < frames; f++) {
-            gameApp.actionManager.update(deltaSec);
-            renderer.render(stage);
-            if (encErr) { throw encErr; }
-            if (streamErr) { throw streamErr; }
-            var vf = new VideoFrame(canvas, { timestamp: Math.round(globalFrame * 1e6 / fps), duration: Math.round(1e6 / fps) });
-            encoder.encode(vf, { keyFrame: globalFrame % keyint === 0 });
-            vf.close();
-            globalFrame++;
-            if (draining) { await draining; }
-            while (encoder.encodeQueueSize > 8) {
-              await new Promise(function (r) { setTimeout(r, 2); });
-              if (encErr) { throw encErr; }
-            }
-          }
-          if (tick % 100 === 0 || tick === totalTicks) { dlog('tick ' + tick + '/' + totalTicks + ' submitted=' + globalFrame + ' encoded=' + encoded); }
-        }
-
-        // Drain the encoder. Keep a heartbeat timer alive so an occluded window's
-        // event loop is not throttled while we await the final flush.
-        var hb = setInterval(function () {}, 100);
-        try { await encoder.flush(); } finally { clearInterval(hb); }
-        try { encoder.close(); } catch (e) {}
-        if (encErr) { throw encErr; }
-        if (streamErr) { throw streamErr; }
-        dlog('encode complete; submitted=' + globalFrame + ' encoded=' + encoded + '; closing stream');
-        // stream.end's callback fires once all bytes are flushed to the FIFO, so
-        // the host ffmpeg has (or is reading) the full stream before we signal done.
-        await new Promise(function (res) { stream.end(function () { res(); }); });
-        fs.writeFileSync(doneFile, '');
-        // Quit so the next run starts a fresh process: the host can't reliably
-        // kill us when we run inside Steam's pressure-vessel PID namespace, and a
-        // lingering instance would re-handle the next launch with stale state.
-        try { if (typeof window !== 'undefined' && window.close) { window.close(); } } catch (e) {}
-      } catch (err) {
-        fail('board capture error: ' + (err && err.stack || err));
-        try { if (stream) { stream.destroy(); } } catch (e) {}
-      }
-    })();
+  _runBoardCapture(totalTicks) {
+    // screeps-arena-videoizer-runtime-v2: keep the generated bundle patch tiny;
+    // the implementation is copied next to it by this patcher and can be tested.
+    var runtimePath = require('path').join(
+      process.resourcesPath,
+      'app',
+      'dist',
+      'screeps-arena-videoizer',
+      'capture-board-runtime.js'
+    );
+    var options = Number.isSafeInteger(totalTicks) && totalTicks >= 0
+      ? { totalTicks: totalTicks }
+      : {};
+    require(runtimePath).captureBoard(this, options);
   }
 
   _autoplay() {
-    if (this.boardCapture && typeof process !== 'undefined' && process.env && process.env.SCREEPS_ARENA_BOARD_CAPTURE_FIFO) {
+    if (this.boardCapture) {
       this._captureBoard();
       return;
     }
     this.screepsRendererRef.mounted$.pipe(`,
     "main board capture driver",
-    "_runBoardCapture()",
+    "screeps-arena-videoizer-runtime-v2",
   );
 
-  write(file, content);
+  return { file, content };
 }
 
 function patchStyles() {
   const file = files.styles;
-  backup(file);
-  let content = read(file);
-  if (content.includes("html.screeps-board-capture")) return;
+  let content = prepareBase(file, "html.screeps-board-capture");
 
   const css = `
 /* screeps-arena-videoizer: board-capture styles (appended) */
@@ -589,11 +511,78 @@ html.screeps-board-capture canvas {
   // Append (rather than splice after a charset header, which varies by build).
   // All board-capture rules are !important, so trailing position is fine.
   content = content + "\n" + css;
-  write(file, content);
+  return { file, content };
 }
 
-patchIndex();
-patchMain();
-patchStyles();
+function runtimeSources() {
+  return runtimeNames.map((name) => {
+    const source = path.join(projectDir, name);
+    if (!fs.existsSync(source)) throw new Error(`Missing runtime source: ${source}`);
+    return { name, source };
+  });
+}
+
+function installRuntime(sources) {
+  fs.mkdirSync(runtimeDir, { recursive: true });
+  const staged = [];
+  const committed = [];
+  try {
+    for (const { name, source } of sources) {
+      const destination = path.join(runtimeDir, name);
+      const temporary = `${destination}.tmp-${process.pid}`;
+      fs.copyFileSync(source, temporary);
+      staged.push({
+        temporary,
+        destination,
+        original: fs.existsSync(destination) ? fs.readFileSync(destination) : null,
+      });
+    }
+    for (const entry of staged) {
+      fs.renameSync(entry.temporary, entry.destination);
+      committed.push(entry);
+    }
+  } catch (error) {
+    for (const entry of committed.reverse()) {
+      try {
+        if (entry.original) fs.writeFileSync(entry.destination, entry.original);
+        else fs.rmSync(entry.destination, { force: true });
+      } catch (_) {}
+    }
+    throw error;
+  } finally {
+    for (const { temporary } of staged) fs.rmSync(temporary, { force: true });
+  }
+}
+
+function commitBundles(outputs) {
+  const staged = [];
+  const committed = [];
+  try {
+    for (const { file, content } of outputs) {
+      const temporary = `${file}.videoizer.tmp-${process.pid}`;
+      fs.writeFileSync(temporary, content);
+      staged.push({ file, temporary, original: fs.readFileSync(file) });
+    }
+    for (const entry of staged) {
+      fs.renameSync(entry.temporary, entry.file);
+      committed.push(entry);
+    }
+  } catch (error) {
+    // A replacement-anchor or staging error happens before this function. If a
+    // filesystem failure occurs during the short rename phase, restore every
+    // bundle already replaced so the client never remains partially patched.
+    for (const entry of committed.reverse()) {
+      try { fs.writeFileSync(entry.file, entry.original); } catch (_) {}
+    }
+    throw error;
+  } finally {
+    for (const { temporary } of staged) fs.rmSync(temporary, { force: true });
+  }
+}
+
+const sources = runtimeSources();
+const outputs = [patchIndex(), patchMain(), patchStyles()];
+installRuntime(sources);
+commitBundles(outputs);
 
 console.log(`Patched Screeps Arena at ${appRoot}`);
