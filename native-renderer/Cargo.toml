@@ -1,0 +1,33 @@
+[package]
+name = "screeps-arena-native-renderer"
+version = "0.1.0"
+edition = "2024"
+license = "ISC"
+description = "Native temporal ReplayIR frontend for Screeps Arena video rendering"
+
+[dependencies]
+base64 = "0.22.1"
+bytemuck = { version = "1.25.1", features = ["derive"] }
+cudarc = { version = "0.16.4", features = ["cuda-12090"] }
+earcutr = "0.5.0"
+fontdue = "0.9.4"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
+naga = { version = "27.0.3", features = ["wgsl-in"] }
+nvidia-video-codec-sdk = { version = "=0.4.0", path = "vendor/nvidia-video-codec-sdk" }
+resvg = { version = "0.47.0", default-features = false, features = ["raster-images"] }
+ryu-js = "1.0.3"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.145", features = ["float_roundtrip", "preserve_order"] }
+sha2 = "0.10.9"
+thiserror = "2.0.17"
+wgpu = { version = "27.0.1", default-features = false, features = ["std", "vulkan", "wgsl"] }
+
+[target.'cfg(unix)'.dependencies]
+ash = "0.38.0"
+libc = "0.2.189"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+strip = "debuginfo"

@@ -5,7 +5,8 @@
   "license": "ISC",
   "type": "commonjs",
   "scripts": {
-    "check": "bash -n record-board-x11.sh && node --check patch-screeps-arena.js"
+    "test": "node --test test/*.test.js",
+    "test:native": "cargo fmt --manifest-path native-renderer/Cargo.toml -- --check && cargo test --manifest-path native-renderer/Cargo.toml --offline",
+    "check": "bash -n record-board-x11.sh && node --check patch-screeps-arena.js && node --check board-framing.js && node --check capture-config.js && node --check capture-rng.js && node --check capture-scene.js && node --check capture-transport.js && node --check capture-board-runtime.js && node --check renderer-actions.js && node --check renderer-calculations.js && node --check renderer-expressions.js && node --check renderer-processors.js && node --check renderer-random.js && node --check replay-batches.js && node --check replay-ir.js && node --check virtual-timeline.js && npm test && npm run test:native"
   }
 }
-
