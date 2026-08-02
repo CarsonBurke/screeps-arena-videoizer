@@ -8,13 +8,14 @@ use std::thread;
 use screeps_arena_native_renderer::{
     Affine2, BoardTransform, GpuTerrainBlurBank, GpuTerrainMaskBank, GpuTerrainWallBank,
     GpuTextureAtlas, LeasedTerrainPhase, Nv12BatchConverter, Nv12ReadbackBuffer, PIXI_COLOR_FORMAT,
-    PreparedSpriteInstance, PreparedVector, SceneDisplayEntry, SceneDrawableKind, SpriteBlendMode,
-    SpriteInstance, SpritePipeline, TemporalLayerCompositor, TemporalRenderBatch,
-    TemporalSceneBatch, TemporalSpriteBatch, TemporalSpriteRenderer, TemporalTerrainBatch,
-    TemporalTerrainSceneBatch, TemporalVectorBatch, TerrainCommandUploads, TerrainDrawOp,
-    TerrainDrawPhase, TerrainDrawPlan, TerrainDrawSource, TerrainMaskBindings, TerrainPipeline,
-    TerrainPlacement, TextureAtlas, TextureAtlasPage, VectorCommand, VectorFillStyle,
-    VectorPipeline, VectorProgram, rgba8_to_nv12_reference, tessellate_vector_program,
+    PackedNv12Converter, PreparedSpriteInstance, PreparedVector, SceneDisplayEntry,
+    SceneDrawableKind, SpriteBlendMode, SpriteInstance, SpritePipeline, TemporalLayerCompositor,
+    TemporalRenderBatch, TemporalSceneBatch, TemporalSpriteBatch, TemporalSpriteRenderer,
+    TemporalTerrainBatch, TemporalTerrainSceneBatch, TemporalVectorBatch, TerrainCommandUploads,
+    TerrainDrawOp, TerrainDrawPhase, TerrainDrawPlan, TerrainDrawSource, TerrainMaskBindings,
+    TerrainPipeline, TerrainPlacement, TextureAtlas, TextureAtlasPage, VectorCommand,
+    VectorFillStyle, VectorPipeline, VectorProgram, rgba8_to_nv12_reference,
+    tessellate_vector_program,
 };
 
 fn main() {
@@ -136,6 +137,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let compositor = TemporalLayerCompositor::create(&device, 64, 64, views, slots)?;
     let converter = Nv12BatchConverter::create(&device, renderer.target(0)?)?;
+    let _packed_converter = PackedNv12Converter::create(&device, renderer.target(0)?)?;
     let second_converter = Nv12BatchConverter::create(&device, renderer.target(1)?)?;
     let mut readback = Nv12ReadbackBuffer::create(&device, converter.layout())?;
     let mut second_readback = Nv12ReadbackBuffer::create(&device, second_converter.layout())?;
@@ -383,6 +385,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             compositor: &compositor,
             terrain: &scene_terrain,
             scene: &scene_batch,
+            clear_color: wgpu::Color::TRANSPARENT,
+            terrain_cache: None,
         },
     )?;
     let pending =

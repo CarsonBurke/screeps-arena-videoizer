@@ -354,6 +354,7 @@ fn resolve_processor(
     let payload = processor
         .payload
         .evaluate(&roots.context(None), &mut || random.next_f64())?;
+    let payload = strip_native_adapter_markers(payload);
     let object_texture = if processor.kind == crate::ProcessorKind::Sprite
         && processor.uses_object_texture_fallback
     {
@@ -377,6 +378,92 @@ fn resolve_processor(
                 object_texture.as_ref(),
             )?),
         ),
+        crate::ProcessorKind::CreepBuildBody => {
+            let payload = creep_build_body_payload(&payload, &roots.state)?;
+            (
+                payload,
+                Some(GenericResult {
+                    node_id: None,
+                    target_is_root: false,
+                    touches_node: false,
+                    creates_node: true,
+                    // The official processor returns undefined and publishes
+                    // only a private `scope.bodySprites` array. Keep the
+                    // collapsed native mesh out of the addressable scope.
+                    temporary_node: true,
+                }),
+            )
+        }
+        crate::ProcessorKind::CreepActions => {
+            let entity = entities[interval.entity_id.as_str()];
+            let previous_state = interval
+                .start_tick
+                .checked_sub(1)
+                .filter(|tick| entity.alive_at(*tick))
+                .map(|tick| EntityValueRoots::at(entity, tick, tick_duration))
+                .transpose()?
+                .map(|roots| {
+                    processor
+                        .path
+                        .as_deref()
+                        .map_or(roots.state.clone(), |path| {
+                            processor_state(&roots.state, path)
+                        })
+                });
+            match crate::creep_actions::lower_supported_payload(
+                &payload,
+                &roots.state,
+                previous_state.as_ref(),
+                tick_duration.as_f64(),
+                &artifact.renderer_contract.world_options,
+            )? {
+                Some(payload) => (
+                    payload,
+                    Some(GenericResult {
+                        node_id: None,
+                        target_is_root: false,
+                        touches_node: false,
+                        creates_node: false,
+                        temporary_node: false,
+                    }),
+                ),
+                None => (payload.clone(), None),
+            }
+        }
+        crate::ProcessorKind::CreepDecoration | crate::ProcessorKind::ObjectDecoration
+            if decoration_kind_is_absent(artifact, processor.kind) =>
+        {
+            let payload = ResolvedValue::Object(BTreeMap::from([(
+                "$nativeDecorationNoop".to_owned(),
+                ResolvedValue::Bool(true),
+            )]));
+            (
+                payload,
+                Some(GenericResult {
+                    node_id: None,
+                    target_is_root: false,
+                    touches_node: false,
+                    creates_node: false,
+                    temporary_node: false,
+                }),
+            )
+        }
+        crate::ProcessorKind::Text => {
+            let stage_zoom = artifact
+                .replay
+                .render_config
+                .0
+                .as_ref()
+                .map(|config| config.board_frame.zoom)
+                .unwrap_or(f64::NAN);
+            match crate::text_raster::lower_supported_text_payload(&payload, stage_zoom)? {
+                Some(payload) => {
+                    let result = generic_result(processor, &payload, None)?;
+                    (payload, Some(result))
+                }
+                None => (payload.clone(), None),
+            }
+        }
         crate::ProcessorKind::ResourceCircle => {
             let entity = entities[interval.entity_id.as_str()];
             let previous_state = interval
@@ -463,6 +550,200 @@ fn resolve_processor(
             .is_some_and(|result| result.temporary_node),
         actions,
     })
+}
+
+fn decoration_kind_is_absent(artifact: &ReplayArtifact, kind: crate::ProcessorKind) -> bool {
+    let expected = match kind {
+        crate::ProcessorKind::CreepDecoration => "creep",
+        crate::ProcessorKind::ObjectDecoration => "object",
+        _ => return false,
+    };
+    !artifact.renderer_contract.decorations.iter().any(|item| {
+        item.get("decoration")
+            .and_then(|decoration| decoration.get("type"))
+            .and_then(serde_json::Value::as_str)
+            == Some(expected)
+    })
+}
+
+fn strip_native_adapter_markers(payload: ResolvedValue) -> ResolvedValue {
+    let ResolvedValue::Object(mut payload) = payload else {
+        return payload;
+    };
+    payload.retain(|key, _| !key.starts_with("$native"));
+    ResolvedValue::Object(payload)
+}
+
+fn creep_build_body_payload(
+    payload: &ResolvedValue,
+    state: &ResolvedValue,
+) -> Result<ResolvedValue> {
+    const ANGLE_SHIFT: f64 = -std::f64::consts::FRAC_PI_2;
+    const PART_ANGLE: f64 = std::f64::consts::PI / 50.0;
+    const ARC_RADIUS: f64 = 41.0;
+    const LINE_WIDTH: f64 = 18.0;
+
+    #[derive(Clone)]
+    struct BodyGroup {
+        kind: String,
+        hits: f64,
+    }
+
+    let mut output = payload
+        .as_object()
+        .ok_or_else(|| {
+            Error::Invalid("creepBuildBody payload must resolve to an object".to_owned())
+        })?
+        .clone();
+    let state = state.as_object().ok_or_else(|| {
+        Error::Invalid("creepBuildBody state must resolve to an object".to_owned())
+    })?;
+    let body = state
+        .get("body")
+        .ok_or_else(|| Error::Invalid("creepBuildBody state lacks body".to_owned()))?;
+    let parts = match body {
+        ResolvedValue::Array(parts) => parts.iter().collect::<Vec<_>>(),
+        ResolvedValue::Object(parts) => parts.values().collect::<Vec<_>>(),
+        _ => {
+            return Err(Error::Invalid(
+                "creepBuildBody state body must resolve to an array or object".to_owned(),
+            ));
+        }
+    };
+
+    let mut groups = Vec::<BodyGroup>::new();
+    let mut has_tough = false;
+    for part in parts {
+        let part = part.as_object().ok_or_else(|| {
+            Error::Invalid("creepBuildBody body part must resolve to an object".to_owned())
+        })?;
+        let kind = part
+            .get("type")
+            .and_then(ResolvedValue::as_string)
+            .ok_or_else(|| {
+                Error::Invalid("creepBuildBody body part type must be a string".to_owned())
+            })?;
+        let hits = part
+            .get("hits")
+            .and_then(ResolvedValue::as_number)
+            .ok_or_else(|| {
+                Error::Invalid("creepBuildBody body part hits must be a number".to_owned())
+            })?;
+        if !hits.is_finite() {
+            return Err(Error::Invalid(
+                "creepBuildBody body part hits must be finite".to_owned(),
+            ));
+        }
+        if hits <= 0.0 {
+            continue;
+        }
+        if kind == "tough" {
+            has_tough = true;
+            continue;
+        }
+        if kind == "carry" {
+            continue;
+        }
+        if let Some(group) = groups.iter_mut().find(|group| group.kind == kind) {
+            group.hits += hits;
+        } else {
+            groups.push(BodyGroup {
+                kind: kind.to_owned(),
+                hits,
+            });
+        }
+    }
+    // V8's stable Array#sort preserves the first-body-occurrence order for
+    // equal aggregate hit counts.
+    groups.sort_by(|left, right| left.hits.total_cmp(&right.hits));
+
+    let mut drawings = Vec::with_capacity(groups.len() * 4);
+    let mut front_angle = 0.0;
+    let mut back_angle = std::f64::consts::PI;
+    for group in groups {
+        let (color, back_side) = match group.kind.as_str() {
+            "move" => (0xaa_b7_c5, true),
+            "work" => (0xfd_e5_74, false),
+            "attack" => (0xf7_2e_41, false),
+            "ranged_attack" => (0x7f_a7_e5, false),
+            "heal" => (0x56_cf_5e, false),
+            "claim" => (0xb9_9c_fb, false),
+            // The reference renderer warns and emits nothing for unknown body
+            // types after filtering TOUGH and CARRY.
+            _ => continue,
+        };
+        let start_angle = if back_side { back_angle } else { front_angle };
+        let angle = PART_ANGLE * (group.hits / 100.0);
+        let effective_color = multiply_srgb8(color, color);
+        drawings.push(draw_command(
+            "lineStyle",
+            vec![
+                ResolvedValue::Number(LINE_WIDTH),
+                ResolvedValue::Number(f64::from(effective_color)),
+                ResolvedValue::Number(1.0),
+            ],
+        ));
+        drawings.push(draw_command(
+            "arc",
+            vec![
+                ResolvedValue::Number(0.0),
+                ResolvedValue::Number(0.0),
+                ResolvedValue::Number(ARC_RADIUS),
+                ResolvedValue::Number(ANGLE_SHIFT + start_angle),
+                ResolvedValue::Number(ANGLE_SHIFT + start_angle + angle),
+                ResolvedValue::Bool(false),
+            ],
+        ));
+        drawings.push(draw_command(
+            "lineStyle",
+            vec![
+                ResolvedValue::Number(LINE_WIDTH),
+                ResolvedValue::Number(f64::from(effective_color)),
+                ResolvedValue::Number(1.0),
+            ],
+        ));
+        drawings.push(draw_command(
+            "arc",
+            vec![
+                ResolvedValue::Number(0.0),
+                ResolvedValue::Number(0.0),
+                ResolvedValue::Number(ARC_RADIUS),
+                ResolvedValue::Number(ANGLE_SHIFT - start_angle),
+                ResolvedValue::Number(ANGLE_SHIFT - start_angle - angle),
+                ResolvedValue::Bool(true),
+            ],
+        ));
+        if back_side {
+            back_angle += angle;
+        } else {
+            front_angle += angle;
+        }
+    }
+    output.insert("drawings".to_owned(), ResolvedValue::Array(drawings));
+    output.insert(
+        "$nativeCreepBodyHasTough".to_owned(),
+        ResolvedValue::Bool(has_tough),
+    );
+    Ok(ResolvedValue::Object(output))
+}
+
+fn draw_command(method: &str, params: Vec<ResolvedValue>) -> ResolvedValue {
+    ResolvedValue::Object(BTreeMap::from([
+        (
+            "method".to_owned(),
+            ResolvedValue::String(method.to_owned()),
+        ),
+        ("params".to_owned(), ResolvedValue::Array(params)),
+    ]))
+}
+
+fn multiply_srgb8(left: u32, right: u32) -> u32 {
+    let channel = |shift: u32| {
+        let left = (left >> shift) & 0xff;
+        let right = (right >> shift) & 0xff;
+        (left * right + 127) / 255
+    };
+    (channel(16) << 16) | (channel(8) << 8) | channel(0)
 }
 
 fn processor_state(state: &ResolvedValue, path: &str) -> ResolvedValue {
@@ -890,8 +1171,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        GenericResult, ResolutionScopes, processor_state, resource_circle_result,
-        user_badge_payload,
+        GenericResult, ResolutionScopes, creep_build_body_payload, multiply_srgb8, processor_state,
+        resource_circle_result, strip_native_adapter_markers, user_badge_payload,
     };
 
     #[test]
@@ -913,6 +1194,83 @@ mod tests {
         ResolvedActionParameter, ResolvedActivation, ResolvedScene, ResolvedValue,
         SceneNodeTemplates, SceneSchedule, TextureAtlas, procedural_graphics_assets,
     };
+
+    #[test]
+    fn creep_build_body_lowers_stable_aggregates_and_tough_sprite_marker() {
+        let part = |kind: &str, hits: f64| {
+            ResolvedValue::Object(BTreeMap::from([
+                ("hits".to_owned(), ResolvedValue::Number(hits)),
+                ("type".to_owned(), ResolvedValue::String(kind.to_owned())),
+            ]))
+        };
+        let payload = ResolvedValue::Object(BTreeMap::from([(
+            "parentId".to_owned(),
+            ResolvedValue::String("mainContainer".to_owned()),
+        )]));
+        let state = ResolvedValue::Object(BTreeMap::from([(
+            "body".to_owned(),
+            ResolvedValue::Array(vec![
+                part("move", 100.0),
+                part("attack", 50.0),
+                part("work", 50.0),
+                part("attack", 25.0),
+                part("tough", 100.0),
+                part("carry", 100.0),
+                part("heal", 0.0),
+            ]),
+        )]));
+
+        let lowered = creep_build_body_payload(&payload, &state).unwrap();
+        assert_eq!(
+            lowered.get("parentId"),
+            Some(&ResolvedValue::String("mainContainer".to_owned()))
+        );
+        let program = crate::VectorProgram::from_draw_payload(&lowered).unwrap();
+        assert_eq!(program.commands.len(), 12);
+        assert!(matches!(
+            program.commands[0],
+            crate::VectorCommand::LineStyle(crate::VectorLineStyle { color, .. })
+                if color == multiply_srgb8(0xfd_e5_74, 0xfd_e5_74)
+        ));
+        assert!(matches!(
+            program.commands[4],
+            crate::VectorCommand::LineStyle(crate::VectorLineStyle { color, .. })
+                if color == multiply_srgb8(0xf7_2e_41, 0xf7_2e_41)
+        ));
+        assert!(matches!(
+            program.commands[8],
+            crate::VectorCommand::LineStyle(crate::VectorLineStyle { color, .. })
+                if color == multiply_srgb8(0xaa_b7_c5, 0xaa_b7_c5)
+        ));
+        assert_eq!(
+            lowered.get("$nativeCreepBodyHasTough"),
+            Some(&ResolvedValue::Bool(true))
+        );
+    }
+
+    #[test]
+    fn user_payload_cannot_forge_native_adapter_markers() {
+        let payload = ResolvedValue::Object(BTreeMap::from([
+            (
+                "$nativeDecorationNoop".to_owned(),
+                ResolvedValue::Bool(true),
+            ),
+            ("$nativeTextRaster".to_owned(), ResolvedValue::Bool(true)),
+            (
+                "$nativeFutureAdapter".to_owned(),
+                ResolvedValue::String("forged".to_owned()),
+            ),
+            ("text".to_owned(), ResolvedValue::String("A".to_owned())),
+        ]));
+
+        assert_eq!(
+            strip_native_adapter_markers(payload),
+            ResolvedValue::Object(BTreeMap::from([(
+                "text".to_owned(),
+                ResolvedValue::String("A".to_owned()),
+            )]))
+        );
+    }
 
     #[test]
     fn resource_circle_lowers_official_defaults_and_retains_early_return() {
@@ -1120,10 +1478,11 @@ mod tests {
         root["rendererContract"] = signed(root["rendererContract"].take());
         root["replay"]["rendererContractFingerprint"] =
             root["rendererContract"]["fingerprint"].clone();
-        root["replay"]["entities"][0]["properties"]["type"] = json!([[0, 2], ["unit"], [], []]);
+        root["replay"]["entities"][0]["properties"]["type"] = json!([[0, 2], ["unit"], [], [], []]);
         root["replay"]["entities"][0]["properties"]["store"] = json!([
             [0, 2],
             [{"energy": 625, "energyCapacity": 1250}],
+            [],
             [],
             []
         ]);
@@ -1185,10 +1544,11 @@ mod tests {
             [0, 2],
             [{"one": {"badgeUrl": badge_url.clone()}}],
             [],
+            [],
             []
         ]);
-        root["replay"]["entities"][0]["properties"]["type"] = json!([[0, 2], ["unit"], [], []]);
-        root["replay"]["entities"][0]["properties"]["user"] = json!([[0, 2], ["one"], [], []]);
+        root["replay"]["entities"][0]["properties"]["type"] = json!([[0, 2], ["unit"], [], [], []]);
+        root["replay"]["entities"][0]["properties"]["user"] = json!([[0, 2], ["one"], [], [], []]);
         root["replay"]["rendererGraph"] = json!({
             "columns": [[0, 0, 0], [3, 7, 7], [-1, 0, 0], [-1, -1, -1]],
             "enabled": true,
@@ -1391,7 +1751,7 @@ mod tests {
         root["replay"]["rendererContractFingerprint"] =
             root["rendererContract"]["fingerprint"].clone();
         root["replay"]["randomStateAtFirstTick"] = json!(123);
-        root["replay"]["entities"][0]["properties"]["type"] = json!([[0, 2], ["unit"], [], []]);
+        root["replay"]["entities"][0]["properties"]["type"] = json!([[0, 2], ["unit"], [], [], []]);
         root["replay"]["rendererGraph"] = json!({
             "columns": [[0, 0], [3, 7], [-1, 0], [-1, -1]],
             "enabled": true,
@@ -1472,7 +1832,7 @@ mod tests {
         root["replay"]["rendererContractFingerprint"] =
             root["rendererContract"]["fingerprint"].clone();
         root["replay"]["randomStateAtFirstTick"] = json!(123);
-        root["replay"]["entities"][0]["properties"]["type"] = json!([[0, 2], ["unit"], [], []]);
+        root["replay"]["entities"][0]["properties"]["type"] = json!([[0, 2], ["unit"], [], [], []]);
         root["replay"]["rendererGraph"] = json!({
             "columns": [[0, 0], [3, 7], [-1, 0], [-1, -1]],
             "enabled": true,
@@ -1549,7 +1909,7 @@ mod tests {
         root["replay"]["rendererContractFingerprint"] =
             root["rendererContract"]["fingerprint"].clone();
         root["replay"]["randomStateAtFirstTick"] = json!(123);
-        root["replay"]["entities"][0]["properties"]["type"] = json!([[0, 2], ["unit"], [], []]);
+        root["replay"]["entities"][0]["properties"]["type"] = json!([[0, 2], ["unit"], [], [], []]);
         root["replay"]["rendererGraph"] = json!({
             "columns": [[0, 0, 0], [3, 7, 7], [-1, 0, 1], [-1, -1, -1]],
             "enabled": true,

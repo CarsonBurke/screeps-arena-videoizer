@@ -1,13 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::num::NonZeroU32;
+use std::time::Instant;
 
 use crate::{
     ActionKind, ActionManagerRuntime, ActionRuntime, BoardTransform, Error, FrameSample,
-    PreparedSprite, PreparedSpriteInstance, ProcessorKind, RendererEvent, RendererEventOpcode,
-    RendererPlan, ReplayArtifact, ResolvedActionNode, ResolvedActionParameter, ResolvedActivation,
-    ResolvedScene, ResolvedValue, Result, SceneDisplayEntry, SceneDrawableKind, SceneFrameScratch,
-    SceneNodeKey, SceneNodeTemplate, SceneNodeTemplates, SpriteDisplayEntry, SpritePipeline,
-    TemporalSpriteBatch, TemporalVectorBatch, Timeline, TimelineEvent,
+    PreparedSprite, PreparedSpriteInstance, ProcessorKind, ProcessorPlan, RendererEvent,
+    RendererEventOpcode, RendererPlan, ReplayArtifact, ResolvedActionNode, ResolvedActionParameter,
+    ResolvedActivation, ResolvedScene, ResolvedValue, Result, SceneDisplayEntry, SceneDrawableKind,
+    SceneFrameScratch, SceneNodeKey, SceneNodeTemplate, SceneNodeTemplates, SpriteDisplayEntry,
+    SpritePipeline, TemporalSpriteBatch, TemporalVectorBatch, Timeline, TimelineEvent,
 };
 
 const PROCESSOR_ACTION_GROUP_NAMESPACE: u64 = 1 << 63;
@@ -32,13 +33,21 @@ struct PendingDisappear {
     fade: ActionRuntime,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct TemporalSceneStats {
     pub frames: u64,
     pub batches: u64,
     pub max_instances_per_view: u32,
     pub max_vectors_per_view: u32,
     pub max_vector_vertices_per_batch: u32,
+    pub apply_tick_seconds: f64,
+    pub advance_seconds: f64,
+    pub sprite_prepare_seconds: f64,
+    pub vector_prepare_seconds: f64,
+    pub display_copy_seconds: f64,
+    pub batch_pack_seconds: f64,
+    pub apply_event_seconds: f64,
+    pub display_rebuild_seconds: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -58,24 +67,93 @@ pub struct GenericSceneRuntime<'a> {
     templates: &'a SceneNodeTemplates,
     activations: BTreeMap<u32, &'a ResolvedActivation>,
     nodes: BTreeMap<u32, &'a SceneNodeTemplate>,
-    active_objects: BTreeMap<String, ActiveObject>,
-    active_processors: BTreeMap<(String, String), ActiveProcessor>,
-    active_actions: BTreeMap<(String, String), u64>,
+    processor_definitions: HashMap<&'a str, &'a ProcessorPlan>,
+    active_objects: HashMap<String, ActiveObject>,
+    active_processors: HashMap<String, HashMap<String, ActiveProcessor>>,
+    active_actions: HashMap<String, HashMap<String, u64>>,
     action_manager: ActionManagerRuntime,
+    creep_actions: crate::creep_actions::CreepActionsRuntime,
     pending_disappears: Vec<PendingDisappear>,
     tick_transition_seconds: f64,
     display_order: Vec<SceneDisplayEntry>,
     sprite_display_order: Vec<SpriteDisplayEntry>,
     display_ranks: HashMap<u32, usize>,
+    apply_event_seconds: f64,
+    display_rebuild_seconds: f64,
 }
 
 impl<'a> GenericSceneRuntime<'a> {
+    pub fn unsupported_processor_kinds(scene: &ResolvedScene) -> BTreeSet<ProcessorKind> {
+        scene
+            .activations
+            .iter()
+            .filter_map(|activation| match activation {
+                ResolvedActivation::Processor {
+                    kind: ProcessorKind::CreepActions,
+                    payload,
+                    ..
+                } if payload.get(crate::creep_actions::ADAPTER_MARKER)
+                    == Some(&ResolvedValue::Bool(true)) =>
+                {
+                    None
+                }
+                ResolvedActivation::Processor {
+                    kind: ProcessorKind::CreepDecoration | ProcessorKind::ObjectDecoration,
+                    payload,
+                    ..
+                } if payload.get("$nativeDecorationNoop") == Some(&ResolvedValue::Bool(true)) => {
+                    None
+                }
+                ResolvedActivation::Processor {
+                    kind: ProcessorKind::Text,
+                    payload,
+                    ..
+                } if payload.get("$nativeTextRaster") == Some(&ResolvedValue::Bool(true)) => None,
+                ResolvedActivation::Processor { kind, .. }
+                    if !matches!(
+                        kind,
+                        ProcessorKind::Circle
+                            | ProcessorKind::Container
+                            | ProcessorKind::CreepBuildBody
+                            | ProcessorKind::Draw
+                            | ProcessorKind::ResourceCircle
+                            | ProcessorKind::RunAction
+                            | ProcessorKind::SiteProgress
+                            | ProcessorKind::Sprite
+                            | ProcessorKind::UserBadge
+                    ) =>
+                {
+                    Some(*kind)
+                }
+                ResolvedActivation::Processor { .. }
+                | ResolvedActivation::Action { .. }
+                | ResolvedActivation::Object { .. } => None,
+            })
+            .collect()
+    }
+
+    pub fn validate_scene_support(scene: &ResolvedScene) -> Result<()> {
+        let unsupported = Self::unsupported_processor_kinds(scene);
+        if unsupported.is_empty() {
+            return Ok(());
+        }
+        Err(Error::Invalid(format!(
+            "generic scene runtime lacks processor adapters for {}",
+            unsupported
+                .into_iter()
+                .map(ProcessorKind::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )))
+    }
+
     pub fn new(
         artifact: &'a ReplayArtifact,
         plan: &'a RendererPlan,
         scene: &'a ResolvedScene,
         templates: &'a SceneNodeTemplates,
     ) -> Result<Self> {
+        Self::validate_scene_support(scene)?;
         let activations = scene
             .activations
             .iter()
@@ -94,6 +172,17 @@ impl<'a> GenericSceneRuntime<'a> {
         if nodes.len() != templates.nodes.len() {
             return Err(Error::Invalid(
                 "scene nodes repeat a renderer activation order".to_owned(),
+            ));
+        }
+        let processor_definitions = plan
+            .objects
+            .values()
+            .flat_map(|object| object.processors.iter())
+            .map(|processor| (processor.definition_id.as_str(), processor))
+            .collect::<HashMap<_, _>>();
+        if processor_definitions.len() != plan.processor_definitions {
+            return Err(Error::Invalid(
+                "renderer plan repeats a processor definition ID".to_owned(),
             ));
         }
         let tick_transition_seconds = crate::Rational::parse_rate(
@@ -115,38 +204,55 @@ impl<'a> GenericSceneRuntime<'a> {
             templates,
             activations,
             nodes,
-            active_objects: BTreeMap::new(),
-            active_processors: BTreeMap::new(),
-            active_actions: BTreeMap::new(),
+            processor_definitions,
+            active_objects: HashMap::new(),
+            active_processors: HashMap::new(),
+            active_actions: HashMap::new(),
             action_manager: ActionManagerRuntime::default(),
+            creep_actions: crate::creep_actions::CreepActionsRuntime::default(),
             pending_disappears: Vec::new(),
             tick_transition_seconds,
             display_order: Vec::new(),
             sprite_display_order: Vec::new(),
             display_ranks: HashMap::new(),
+            apply_event_seconds: 0.0,
+            display_rebuild_seconds: 0.0,
         })
     }
 
     pub fn apply_tick(&mut self, tick: u32) -> Result<()> {
         let mut display_order_dirty = false;
-        for event in self.artifact.events_at(tick)? {
-            display_order_dirty |= matches!(
-                event.opcode,
-                RendererEventOpcode::ObjectCreate
-                    | RendererEventOpcode::ObjectRemove
-                    | RendererEventOpcode::ProcessorRun
-                    | RendererEventOpcode::ProcessorDestruct
-            );
-            self.apply_event(event)?;
-        }
+        let apply_started = Instant::now();
+        self.action_manager.begin_lifecycle_batch();
+        let apply_result: Result<()> = (|| {
+            for event in self.artifact.events_at(tick)? {
+                display_order_dirty |= matches!(
+                    event.opcode,
+                    RendererEventOpcode::ObjectCreate
+                        | RendererEventOpcode::ObjectRemove
+                        | RendererEventOpcode::ProcessorRun
+                        | RendererEventOpcode::ProcessorDestruct
+                );
+                self.apply_event(event)?;
+            }
+            Ok(())
+        })();
+        self.action_manager.finish_lifecycle_batch();
+        apply_result?;
+        self.apply_event_seconds += apply_started.elapsed().as_secs_f64();
         if display_order_dirty {
+            let rebuild_started = Instant::now();
             self.rebuild_display_order()?;
+            self.display_rebuild_seconds += rebuild_started.elapsed().as_secs_f64();
         }
         Ok(())
     }
 
     pub fn advance(&mut self, duration_seconds: f64) -> Result<()> {
         self.action_manager.update(duration_seconds)?;
+        let mut display_order_dirty = self
+            .creep_actions
+            .advance(duration_seconds, &mut self.action_manager)?;
         let mut completed = Vec::new();
         for (index, pending) in self.pending_disappears.iter_mut().enumerate() {
             let target = self
@@ -162,7 +268,7 @@ impl<'a> GenericSceneRuntime<'a> {
                 completed.push(index);
             }
         }
-        let display_order_dirty = !completed.is_empty();
+        display_order_dirty |= !completed.is_empty();
         for index in completed.into_iter().rev() {
             let pending = self.pending_disappears.swap_remove(index);
             self.action_manager
@@ -257,6 +363,8 @@ impl<'a> GenericSceneRuntime<'a> {
         let mut batch = TemporalSpriteBatch::empty();
         let mut active_views = 0usize;
         let mut stats = TemporalSceneStats::default();
+        let apply_event_seconds_before = self.apply_event_seconds;
+        let display_rebuild_seconds_before = self.display_rebuild_seconds;
 
         for event in timeline.events() {
             match event? {
@@ -294,6 +402,9 @@ impl<'a> GenericSceneRuntime<'a> {
                 &mut visit,
             )?;
         }
+        stats.apply_event_seconds = self.apply_event_seconds - apply_event_seconds_before;
+        stats.display_rebuild_seconds =
+            self.display_rebuild_seconds - display_rebuild_seconds_before;
         Ok(stats)
     }
 
@@ -306,7 +417,7 @@ impl<'a> GenericSceneRuntime<'a> {
         timeline: Timeline,
         board: BoardTransform,
         views_per_batch: NonZeroU32,
-        mut visit: impl FnMut(&[FrameSample], &TemporalSceneBatch) -> Result<()>,
+        mut visit: impl FnMut(&[FrameSample], TemporalSceneBatch) -> Result<()>,
     ) -> Result<TemporalSceneStats> {
         let capacity = views_per_batch.get() as usize;
         if !(SpritePipeline::MIN_VIEWS_PER_BATCH..=SpritePipeline::MAX_VIEWS_PER_BATCH)
@@ -328,16 +439,32 @@ impl<'a> GenericSceneRuntime<'a> {
         let mut frames = Vec::<FrameSample>::with_capacity(capacity);
         let mut active_views = 0usize;
         let mut stats = TemporalSceneStats::default();
+        let apply_event_seconds_before = self.apply_event_seconds;
+        let display_rebuild_seconds_before = self.display_rebuild_seconds;
 
         for event in timeline.events() {
             match event? {
-                TimelineEvent::ApplyTick { tick, .. } => self.apply_tick(tick)?,
-                TimelineEvent::Advance(step) => self.advance(step.duration_seconds)?,
+                TimelineEvent::ApplyTick { tick, .. } => {
+                    let started = Instant::now();
+                    self.apply_tick(tick)?;
+                    stats.apply_tick_seconds += started.elapsed().as_secs_f64();
+                }
+                TimelineEvent::Advance(step) => {
+                    let started = Instant::now();
+                    self.advance(step.duration_seconds)?;
+                    stats.advance_seconds += started.elapsed().as_secs_f64();
+                }
                 TimelineEvent::Render(frame) => {
+                    let sprite_started = Instant::now();
                     self.prepare_gpu_instances(board, &mut sprite_views[active_views])?;
+                    stats.sprite_prepare_seconds += sprite_started.elapsed().as_secs_f64();
+                    let vector_started = Instant::now();
                     vector_views[active_views] = self.prepare_vectors(frame.tick, board)?;
+                    stats.vector_prepare_seconds += vector_started.elapsed().as_secs_f64();
+                    let display_started = Instant::now();
                     display_views[active_views].clear();
                     display_views[active_views].extend_from_slice(self.display_order());
+                    stats.display_copy_seconds += display_started.elapsed().as_secs_f64();
                     frames.push(frame);
                     active_views += 1;
                     stats.frames += 1;
@@ -370,6 +497,9 @@ impl<'a> GenericSceneRuntime<'a> {
                 &mut visit,
             )?;
         }
+        stats.apply_event_seconds = self.apply_event_seconds - apply_event_seconds_before;
+        stats.display_rebuild_seconds =
+            self.display_rebuild_seconds - display_rebuild_seconds_before;
         Ok(stats)
     }
 
@@ -401,6 +531,14 @@ impl<'a> GenericSceneRuntime<'a> {
                 }
             }
         }
+        let insertion_order = |activation: &u32| {
+            self.action_manager
+                .display_insertion_order(*activation)
+                .expect("visible targets retain display insertion bookkeeping")
+        };
+        for siblings in children.values_mut() {
+            siblings.sort_by_key(&insertion_order);
+        }
         // Stage traversal assigns every root an updateOrder before layer
         // subtrees are expanded. Relative root order is the stable stage
         // zIndex/insertion order.
@@ -410,7 +548,7 @@ impl<'a> GenericSceneRuntime<'a> {
             left_node
                 .z_index
                 .total_cmp(&right_node.z_index)
-                .then_with(|| left.cmp(right))
+                .then_with(|| insertion_order(left).cmp(&insertion_order(right)))
         });
 
         let mut update_orders = HashMap::<u32, u32>::new();
@@ -543,6 +681,10 @@ impl<'a> GenericSceneRuntime<'a> {
                 root_activation: event.event_index,
             },
         );
+        self.active_processors
+            .insert(entity_id.to_owned(), HashMap::new());
+        self.active_actions
+            .insert(entity_id.to_owned(), HashMap::new());
         Ok(())
     }
 
@@ -553,20 +695,16 @@ impl<'a> GenericSceneRuntime<'a> {
                 "animated scene removes inactive object {entity_id}"
             ))
         })?;
-
         let disappear = self.plan.objects[&object.object_type].disappear_processor
             == Some(ProcessorKind::Disappear);
-        let action_keys = self
+        self.creep_actions
+            .remove_entity(entity_id, &mut self.action_manager, disappear)?;
+        for group in self
             .active_actions
-            .keys()
-            .filter(|(entity, _)| entity == entity_id)
-            .cloned()
-            .collect::<Vec<_>>();
-        for key in action_keys {
-            let group = self
-                .active_actions
-                .remove(&key)
-                .expect("collected active action");
+            .remove(entity_id)
+            .expect("active objects own an action scope")
+            .into_values()
+        {
             if disappear {
                 self.action_manager.detach_group(group)?;
             } else {
@@ -574,12 +712,10 @@ impl<'a> GenericSceneRuntime<'a> {
             }
         }
 
-        let processor_keys = self
+        let active_processors = self
             .active_processors
-            .keys()
-            .filter(|(entity, _)| entity == entity_id)
-            .cloned()
-            .collect::<Vec<_>>();
+            .remove(entity_id)
+            .expect("active objects own a processor scope");
         let mut target_activations = if disappear {
             self.action_manager
                 .retire_entity_scope(entity_id, object.root_activation)
@@ -591,11 +727,7 @@ impl<'a> GenericSceneRuntime<'a> {
                 "disappearing object {entity_id} lacks its root scope target"
             )));
         }
-        for key in processor_keys {
-            let processor = self
-                .active_processors
-                .remove(&key)
-                .expect("collected active processor");
+        for processor in active_processors.into_values() {
             if let Some(group) = processor.action_group {
                 if disappear {
                     self.action_manager.detach_group(group)?;
@@ -662,12 +794,40 @@ impl<'a> GenericSceneRuntime<'a> {
         if activation_entity != entity_id || activation_definition != definition_id {
             return Err(wrong_activation(event));
         }
-        let key = (entity_id.to_owned(), scope_id.clone());
-        if let Some(old) = self.active_processors.remove(&key)
-            && let Some(group) = old.action_group
-        {
-            self.action_manager.detach_group(group)?;
+        if *kind == ProcessorKind::CreepActions {
+            let run = self
+                .templates
+                .creep_actions
+                .runs
+                .get(&event.event_index)
+                .ok_or_else(|| {
+                    Error::Invalid(format!(
+                        "creepActions activation {} lacks its native plan",
+                        event.event_index
+                    ))
+                })?;
+            let root_activation = self
+                .active_objects
+                .get(entity_id)
+                .ok_or_else(|| {
+                    Error::Invalid(format!("creepActions runs for inactive object {entity_id}"))
+                })?
+                .root_activation;
+            self.creep_actions.run(
+                event.event_index,
+                entity_id,
+                root_activation,
+                run,
+                &self.nodes,
+                &mut self.action_manager,
+            )?;
+            return Ok(());
         }
+        let previous = self
+            .active_processors
+            .get_mut(entity_id)
+            .expect("active objects own a processor scope")
+            .remove(scope_id.as_str());
         if *touches_node {
             let node_id = node_id.as_ref().ok_or_else(|| {
                 Error::Invalid(format!(
@@ -683,6 +843,9 @@ impl<'a> GenericSceneRuntime<'a> {
 
         let node = self.nodes.get(&event.event_index).copied();
         if *kind == ProcessorKind::RunAction {
+            if let Some(group) = previous.and_then(|processor| processor.action_group) {
+                self.action_manager.detach_group(group)?;
+            }
             let target_key = SceneNodeKey {
                 entity_id: entity_id.to_owned(),
                 node_id: node_id.clone().unwrap_or_else(|| "__root__".to_owned()),
@@ -698,13 +861,16 @@ impl<'a> GenericSceneRuntime<'a> {
                     Ok::<u64, Error>(group)
                 })
                 .transpose()?;
-            self.active_processors.insert(
-                key,
-                ActiveProcessor {
-                    target_activation: None,
-                    action_group,
-                },
-            );
+            self.active_processors
+                .get_mut(entity_id)
+                .expect("active objects own a processor scope")
+                .insert(
+                    scope_id.clone(),
+                    ActiveProcessor {
+                        target_activation: None,
+                        action_group,
+                    },
+                );
             return Ok(());
         }
         if node.is_none()
@@ -713,6 +879,7 @@ impl<'a> GenericSceneRuntime<'a> {
                 kind,
                 ProcessorKind::Circle
                     | ProcessorKind::Container
+                    | ProcessorKind::CreepBuildBody
                     | ProcessorKind::Draw
                     | ProcessorKind::ResourceCircle
                     | ProcessorKind::SiteProgress
@@ -730,6 +897,7 @@ impl<'a> GenericSceneRuntime<'a> {
                 kind,
                 ProcessorKind::Circle
                     | ProcessorKind::Container
+                    | ProcessorKind::CreepBuildBody
                     | ProcessorKind::Draw
                     | ProcessorKind::ResourceCircle
                     | ProcessorKind::SiteProgress
@@ -743,10 +911,34 @@ impl<'a> GenericSceneRuntime<'a> {
             )));
         }
 
+        let parent_activation = node.and_then(|node| self.parent_activation(node));
+        if *kind == ProcessorKind::CreepBuildBody && parent_activation.is_none() {
+            if let Some(previous) = previous {
+                self.active_processors
+                    .get_mut(entity_id)
+                    .expect("active objects own a processor scope")
+                    .insert(scope_id.clone(), previous);
+            }
+            return Ok(());
+        }
+        if let Some(group) = previous
+            .as_ref()
+            .and_then(|processor| processor.action_group)
+        {
+            self.action_manager.detach_group(group)?;
+        }
+        if *kind == ProcessorKind::CreepBuildBody
+            && let Some(target) = previous.and_then(|processor| processor.target_activation)
+            && self.action_manager.target(target).is_some()
+        {
+            self.action_manager.cancel_for_target(target);
+            self.action_manager.destroy_target(target)?;
+        }
+
         let mut target_activation = None;
         let mut action_group = None;
         if let Some(node) = node
-            && let Some(parent_activation) = self.parent_activation(node)
+            && let Some(parent_activation) = parent_activation
         {
             if *temporary_node {
                 self.action_manager.create_temporary_target_with_parent(
@@ -771,37 +963,50 @@ impl<'a> GenericSceneRuntime<'a> {
                 action_group = Some(group);
             }
         }
-        self.active_processors.insert(
-            key,
-            ActiveProcessor {
-                target_activation,
-                action_group,
-            },
-        );
+        self.active_processors
+            .get_mut(entity_id)
+            .expect("active objects own a processor scope")
+            .insert(
+                scope_id.clone(),
+                ActiveProcessor {
+                    target_activation,
+                    action_group,
+                },
+            );
         Ok(())
     }
 
     fn destruct_processor(&mut self, event: RendererEvent<'_>) -> Result<()> {
         let entity_id = required(event.entity_id, "processor:destruct entity")?;
         let definition_id = required(event.semantic_id, "processor:destruct definition")?;
-        let active_object = self.active_objects.get(entity_id).ok_or_else(|| {
-            Error::Invalid(format!(
+        if !self.active_objects.contains_key(entity_id) {
+            return Err(Error::Invalid(format!(
                 "animated scene destructs processor for inactive object {entity_id}"
-            ))
-        })?;
-        let processor = self.plan.objects[&active_object.object_type]
-            .processors
-            .iter()
-            .find(|processor| processor.definition_id == definition_id)
+            )));
+        }
+        let processor = self
+            .processor_definitions
+            .get(definition_id)
+            .copied()
             .ok_or_else(|| {
                 Error::Invalid(format!(
                     "animated scene references unknown processor {definition_id}"
                 ))
             })?;
-        let key = (entity_id.to_owned(), processor.scope_id.clone());
-        let Some(active) = self.active_processors.remove(&key) else {
+        if processor.kind == ProcessorKind::CreepActions {
+            return Ok(());
+        }
+        let processors = self
+            .active_processors
+            .get_mut(entity_id)
+            .expect("active objects own a processor scope");
+        let Some(active) = processors.remove(processor.scope_id.as_str()) else {
             return Ok(());
         };
+        if processor.kind == ProcessorKind::CreepBuildBody {
+            processors.insert(processor.scope_id.clone(), active);
+            return Ok(());
+        }
         if let Some(target) = active.target_activation
             && self.action_manager.target(target).is_some()
         {
@@ -844,15 +1049,18 @@ impl<'a> GenericSceneRuntime<'a> {
                     target_key.node_id
                 ))
             })?;
-        let key = (entity_id.to_owned(), definition_id.to_owned());
-        if self.active_actions.contains_key(&key) {
+        let actions_for_entity = self
+            .active_actions
+            .get_mut(entity_id)
+            .expect("active objects own an action scope");
+        if actions_for_entity.contains_key(definition_id) {
             return Err(Error::Invalid(format!(
                 "action {definition_id} is already active for {entity_id}"
             )));
         }
         let group = u64::from(event.event_index);
         self.action_manager.start_group(group, target, actions)?;
-        self.active_actions.insert(key, group);
+        actions_for_entity.insert(definition_id.to_owned(), group);
         Ok(())
     }
 
@@ -861,7 +1069,8 @@ impl<'a> GenericSceneRuntime<'a> {
         let definition_id = required(event.semantic_id, "action:finish definition")?;
         let group = self
             .active_actions
-            .remove(&(entity_id.to_owned(), definition_id.to_owned()))
+            .get_mut(entity_id)
+            .and_then(|actions| actions.remove(definition_id))
             .ok_or_else(|| {
                 Error::Invalid(format!(
                     "action {definition_id} is not active for {entity_id}"
@@ -1004,17 +1213,32 @@ impl LayerEmitter<'_> {
             return Ok(());
         }
         let node = self.nodes[&activation];
-        let kind = match node.kind {
-            crate::SceneNodeKind::Sprite { .. } => Some(SceneDrawableKind::Sprite),
-            crate::SceneNodeKind::Vector { .. } => Some(SceneDrawableKind::Vector),
-            crate::SceneNodeKind::Container => None,
-        };
-        if let Some(kind) = kind {
-            self.output.push(SceneDisplayEntry {
+        match node.kind {
+            crate::SceneNodeKind::CreepBody { tough, .. } => {
+                self.output.push(SceneDisplayEntry {
+                    activation_order: activation,
+                    layer_order: self.current_layer,
+                    kind: SceneDrawableKind::Vector,
+                });
+                if tough.is_some() {
+                    self.output.push(SceneDisplayEntry {
+                        activation_order: activation,
+                        layer_order: self.current_layer,
+                        kind: SceneDrawableKind::Sprite,
+                    });
+                }
+            }
+            crate::SceneNodeKind::Sprite { .. } => self.output.push(SceneDisplayEntry {
                 activation_order: activation,
                 layer_order: self.current_layer,
-                kind,
-            });
+                kind: SceneDrawableKind::Sprite,
+            }),
+            crate::SceneNodeKind::Vector { .. } => self.output.push(SceneDisplayEntry {
+                activation_order: activation,
+                layer_order: self.current_layer,
+                kind: SceneDrawableKind::Vector,
+            }),
+            crate::SceneNodeKind::Container => {}
         }
         let child_count = self.children.get(&activation).map_or(0, Vec::len);
         for index in 0..child_count {
@@ -1062,8 +1286,9 @@ fn emit_temporal_scene_batch(
     active_views: usize,
     frames: &[FrameSample],
     stats: &mut TemporalSceneStats,
-    visit: &mut impl FnMut(&[FrameSample], &TemporalSceneBatch) -> Result<()>,
+    visit: &mut impl FnMut(&[FrameSample], TemporalSceneBatch) -> Result<()>,
 ) -> Result<()> {
+    let pack_started = Instant::now();
     if active_views == 0
         || active_views != frames.len()
         || active_views > sprite_views.len()
@@ -1128,9 +1353,10 @@ fn emit_temporal_scene_batch(
     stats.max_vector_vertices_per_batch = stats
         .max_vector_vertices_per_batch
         .max(vectors.referenced_vertex_count());
+    stats.batch_pack_seconds += pack_started.elapsed().as_secs_f64();
     visit(
         frames,
-        &TemporalSceneBatch {
+        TemporalSceneBatch {
             sprites,
             vectors,
             display_order,
@@ -1139,32 +1365,35 @@ fn emit_temporal_scene_batch(
 }
 
 fn merge_temporal_display_order(views: &[&[SceneDisplayEntry]]) -> Result<Vec<SceneDisplayEntry>> {
-    let mut identities = BTreeMap::<u32, SceneDisplayEntry>::new();
-    let mut edges = BTreeMap::<u32, BTreeSet<u32>>::new();
-    let mut indegrees = BTreeMap::<u32, u32>::new();
+    type DrawableIdentity = (u32, SceneDrawableKind);
+    let identity = |entry: &SceneDisplayEntry| (entry.activation_order, entry.kind);
+    let mut identities = BTreeMap::<DrawableIdentity, SceneDisplayEntry>::new();
+    let mut edges = BTreeMap::<DrawableIdentity, BTreeSet<DrawableIdentity>>::new();
+    let mut indegrees = BTreeMap::<DrawableIdentity, u32>::new();
     let mut seen = BTreeSet::new();
     for view in views {
         seen.clear();
         for entry in *view {
-            if !seen.insert(entry.activation_order) {
+            let identity = identity(entry);
+            if !seen.insert(identity) {
                 return Err(Error::Invalid(
-                    "temporal display view repeats a drawable activation".to_owned(),
+                    "temporal display view repeats a drawable identity".to_owned(),
                 ));
             }
-            if let Some(existing) = identities.insert(entry.activation_order, *entry)
+            if let Some(existing) = identities.insert(identity, *entry)
                 && existing != *entry
             {
                 return Err(Error::Invalid(format!(
-                    "drawable activation {} changes kind or layer across temporal views",
+                    "drawable activation {} changes layer across temporal views",
                     entry.activation_order
                 )));
             }
-            edges.entry(entry.activation_order).or_default();
-            indegrees.entry(entry.activation_order).or_default();
+            edges.entry(identity).or_default();
+            indegrees.entry(identity).or_default();
         }
         for adjacent in view.windows(2) {
-            let before = adjacent[0].activation_order;
-            let after = adjacent[1].activation_order;
+            let before = identity(&adjacent[0]);
+            let after = identity(&adjacent[1]);
             if edges.entry(before).or_default().insert(after) {
                 let indegree = indegrees.entry(after).or_default();
                 *indegree = indegree.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
@@ -1174,12 +1403,12 @@ fn merge_temporal_display_order(views: &[&[SceneDisplayEntry]]) -> Result<Vec<Sc
 
     let mut ready = indegrees
         .iter()
-        .filter_map(|(activation, indegree)| (*indegree == 0).then_some(*activation))
+        .filter_map(|(identity, indegree)| (*indegree == 0).then_some(*identity))
         .collect::<BTreeSet<_>>();
     let mut output = Vec::with_capacity(identities.len());
-    while let Some(activation) = ready.pop_first() {
-        output.push(identities[&activation]);
-        for after in &edges[&activation] {
+    while let Some(identity) = ready.pop_first() {
+        output.push(identities[&identity]);
+        for after in &edges[&identity] {
             let indegree = indegrees
                 .get_mut(after)
                 .expect("edge target has an indegree");
@@ -1235,12 +1464,59 @@ mod tests {
 
     use crate::artifact::tests::{artifact_json, signed};
     use crate::{
-        AtlasEntry, BoardTransform, GenericSceneRuntime, RendererPlan, ReplayArtifact,
-        ResolvedScene, SceneDisplayEntry, SceneDrawableKind, SceneNodeTemplates, SceneSchedule,
-        TextureAtlas, TextureAtlasPage, Timeline, TimelineEvent,
+        AtlasEntry, BoardTransform, GenericSceneRuntime, ProcessorKind, RendererPlan,
+        ReplayArtifact, ResolvedActivation, ResolvedScene, ResolvedValue, SceneDisplayEntry,
+        SceneDrawableKind, SceneNodeTemplates, SceneSchedule, TextureAtlas, TextureAtlasPage,
+        Timeline, TimelineEvent,
     };
 
     use super::merge_temporal_display_order;
+
+    fn processor_activation(kind: ProcessorKind, activation_order: u32) -> ResolvedActivation {
+        ResolvedActivation::Processor {
+            entity_id: "entity".to_owned(),
+            object_type: "object".to_owned(),
+            definition_id: format!("processor-{activation_order}"),
+            scope_id: format!("scope-{activation_order}"),
+            kind,
+            layer: None,
+            z_index: 0.0,
+            activation_order,
+            start_tick: 0,
+            end_tick: 1,
+            payload: ResolvedValue::Null,
+            object_texture: None,
+            node_id: None,
+            target_is_root: false,
+            touches_node: false,
+            temporary_node: false,
+            actions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn generic_runtime_fails_closed_on_missing_processor_adapters() {
+        let scene = ResolvedScene {
+            activations: vec![
+                processor_activation(ProcessorKind::Sprite, 0),
+                processor_activation(ProcessorKind::Text, 1),
+                processor_activation(ProcessorKind::CreepActions, 2),
+                processor_activation(ProcessorKind::Text, 3),
+            ],
+            final_random_state: 0,
+        };
+        let unsupported = GenericSceneRuntime::unsupported_processor_kinds(&scene);
+        assert_eq!(
+            unsupported.into_iter().collect::<Vec<_>>(),
+            vec![ProcessorKind::CreepActions, ProcessorKind::Text]
+        );
+        assert_eq!(
+            GenericSceneRuntime::validate_scene_support(&scene)
+                .unwrap_err()
+                .to_string(),
+            "generic scene runtime lacks processor adapters for creepActions, text"
+        );
+    }
 
     #[test]
     fn temporal_display_union_preserves_cross_kind_edges_and_rejects_cycles() {
@@ -1329,7 +1605,7 @@ mod tests {
         root["rendererContract"] = signed(root["rendererContract"].take());
         root["replay"]["rendererContractFingerprint"] =
             root["rendererContract"]["fingerprint"].clone();
-        root["replay"]["entities"][0]["properties"]["type"] = json!([[0, 2], ["unit"], [], []]);
+        root["replay"]["entities"][0]["properties"]["type"] = json!([[0, 2], ["unit"], [], [], []]);
         root["replay"]["rendererGraph"] = json!({
             "columns": [[0, 0], [3, 7], [-1, 0], [-1, -1]],
             "enabled": true,
@@ -1397,6 +1673,157 @@ mod tests {
     }
 
     #[test]
+    fn creep_body_uses_tough_sprite_and_survives_unavailable_replacement_parent() {
+        let mut root: Value = serde_json::from_slice(&artifact_json()).unwrap();
+        root["rendererContract"]["metadata"]["objects"]["unit"] = json!({
+            "actions": [],
+            "calculations": [],
+            "data": {},
+            "processors": [{
+                "id": "main",
+                "type": "container"
+            }, {
+                "id": "body",
+                "payload": {"parentId": "main"},
+                "type": "creepBuildBody"
+            }]
+        });
+        root["rendererContract"]["resources"]["tough"] = json!({
+            "dataUrl": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP4z8DwHwAFgAI/ScL2JAAAAABJRU5ErkJggg==",
+            "height": 120,
+            "width": 120
+        });
+        root["rendererContract"]["inventory"]["processorTypes"] =
+            json!(["container", "creepBuildBody"]);
+        root["rendererContract"]
+            .as_object_mut()
+            .unwrap()
+            .remove("fingerprint");
+        root["rendererContract"] = signed(root["rendererContract"].take());
+        root["replay"]["rendererContractFingerprint"] =
+            root["rendererContract"]["fingerprint"].clone();
+        root["replay"]["totalTicks"] = json!(2);
+        root["replay"]["entities"][0]["lifetimes"] = json!([[0, 3]]);
+        root["replay"]["entities"][0]["properties"]["type"] = json!([[0, 3], ["unit"], [], [], []]);
+        root["replay"]["entities"][0]["properties"]["body"] = json!([
+            [0, 3],
+            [[
+                {"hits": 100, "type": "move"},
+                {"hits": 100, "type": "tough"}
+            ]],
+            [],
+            [],
+            []
+        ]);
+        root["replay"]["objectOrder"] = json!([[0, 3], [["one"]], [], [], []]);
+        root["replay"]["visualOverlay"]["states"] = json!([[0, 3], [[]], [], [], []]);
+        root["replay"]["rendererGraph"] = json!({
+            "columns": [
+                [0, 0, 0, 0, 0, 0, 0, 0],
+                [3, 7, 7, 6, 7, 6, 7, 7],
+                [-1, 0, 1, 0, 1, 1, 0, 1],
+                [-1, -1, -1, -1, -1, -1, -1, -1]
+            ],
+            "enabled": true,
+            "entityIds": ["one"],
+            "offsets": [0, 3, 6, 8],
+            "payloads": [],
+            "semanticIds": [
+                "auto:$.objects.unit.processors[0]",
+                "auto:$.objects.unit.processors[1]"
+            ]
+        });
+        root["replay"]
+            .as_object_mut()
+            .unwrap()
+            .remove("fingerprint");
+        root["replay"] = signed(root["replay"].take());
+
+        let artifact = ReplayArtifact::from_slice(&serde_json::to_vec(&root).unwrap()).unwrap();
+        let plan = RendererPlan::compile(&artifact.renderer_contract).unwrap();
+        let schedule = SceneSchedule::compile(&artifact, &plan).unwrap();
+        let scene = ResolvedScene::compile(&artifact, &plan, &schedule).unwrap();
+        let mut atlas = unit_atlas();
+        atlas.entries.insert(
+            "tough".to_owned(),
+            AtlasEntry {
+                page: 0,
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+                logical_width: 120.0,
+                logical_height: 120.0,
+                u_min: 0.0,
+                v_min: 0.0,
+                u_max: 1.0,
+                v_max: 1.0,
+            },
+        );
+        let templates = SceneNodeTemplates::compile(&scene, &atlas).unwrap();
+        let mut runtime = GenericSceneRuntime::new(&artifact, &plan, &scene, &templates).unwrap();
+
+        runtime.apply_tick(0).unwrap();
+        assert_eq!(runtime.prepare_vectors(0, board()).unwrap().len(), 1);
+        let sprites = runtime.prepare(0, board()).unwrap();
+        assert_eq!(sprites.len(), 1);
+        assert_eq!(sprites[0].natural_size, [120.0, 120.0]);
+        assert_eq!(sprites[0].anchor, [0.5, 0.5]);
+        assert_eq!(
+            runtime
+                .display_order()
+                .iter()
+                .map(|entry| (entry.activation_order, entry.kind))
+                .collect::<Vec<_>>(),
+            [
+                (2, SceneDrawableKind::Vector),
+                (2, SceneDrawableKind::Sprite),
+            ]
+        );
+
+        runtime.apply_tick(1).unwrap();
+        assert!(
+            runtime.action_manager().target(2).is_some(),
+            "a rerun without its parent must retain the previous private body target"
+        );
+        assert!(runtime.action_manager().target(4).is_none());
+
+        runtime.apply_tick(2).unwrap();
+        assert!(runtime.action_manager().target(2).is_none());
+        assert!(runtime.action_manager().target(7).is_some());
+        assert_eq!(
+            runtime
+                .display_order()
+                .iter()
+                .map(|entry| (entry.activation_order, entry.kind))
+                .collect::<Vec<_>>(),
+            [
+                (7, SceneDrawableKind::Vector),
+                (7, SceneDrawableKind::Sprite),
+            ]
+        );
+
+        let mut streamed = GenericSceneRuntime::new(&artifact, &plan, &scene, &templates).unwrap();
+        let mut saw_compound_body = false;
+        streamed
+            .visit_temporal_scene_batches(
+                Timeline::from_replay(&artifact.replay).unwrap(),
+                board(),
+                NonZeroU32::new(2).unwrap(),
+                |_frames, batch| {
+                    saw_compound_body |= batch.display_order.windows(2).any(|entries| {
+                        entries[0].activation_order == entries[1].activation_order
+                            && entries[0].kind == SceneDrawableKind::Vector
+                            && entries[1].kind == SceneDrawableKind::Sprite
+                    });
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(saw_compound_body);
+    }
+
+    #[test]
     fn run_action_processor_targets_an_existing_scope_node_without_an_adapter() {
         let mut root: Value = serde_json::from_slice(&artifact_json()).unwrap();
         root["rendererContract"]["metadata"]["objects"]["unit"] = json!({
@@ -1424,7 +1851,7 @@ mod tests {
         root["rendererContract"] = signed(root["rendererContract"].take());
         root["replay"]["rendererContractFingerprint"] =
             root["rendererContract"]["fingerprint"].clone();
-        root["replay"]["entities"][0]["properties"]["type"] = json!([[0, 2], ["unit"], [], []]);
+        root["replay"]["entities"][0]["properties"]["type"] = json!([[0, 2], ["unit"], [], [], []]);
         root["replay"]["rendererGraph"] = json!({
             "columns": [[0, 0, 0], [3, 7, 7], [-1, 0, 1], [-1, -1, -1]],
             "enabled": true,
@@ -1503,9 +1930,9 @@ mod tests {
             root["rendererContract"]["fingerprint"].clone();
         root["replay"]["totalTicks"] = json!(2);
         root["replay"]["entities"][0]["lifetimes"] = json!([[0, 1], [2, 3]]);
-        root["replay"]["entities"][0]["properties"]["type"] = json!([[0, 3], ["unit"], [], []]);
-        root["replay"]["objectOrder"] = json!([[0, 3], [["one"]], [], []]);
-        root["replay"]["visualOverlay"]["states"] = json!([[0, 3], [[]], [], []]);
+        root["replay"]["entities"][0]["properties"]["type"] = json!([[0, 3], ["unit"], [], [], []]);
+        root["replay"]["objectOrder"] = json!([[0, 3], [["one"]], [], [], []]);
+        root["replay"]["visualOverlay"]["states"] = json!([[0, 3], [[]], [], [], []]);
         root["replay"]["timeline"]["tickTransitionSeconds"] = json!("1");
         root["replay"]["rendererGraph"] = json!({
             "columns": [
@@ -1598,7 +2025,7 @@ mod tests {
         root["replay"]["rendererContractFingerprint"] =
             root["rendererContract"]["fingerprint"].clone();
         root["replay"]["entities"][0]["lifetimes"] = json!([[0, 1]]);
-        root["replay"]["entities"][0]["properties"]["type"] = json!([[0, 1], ["unit"], [], []]);
+        root["replay"]["entities"][0]["properties"]["type"] = json!([[0, 1], ["unit"], [], [], []]);
         root["replay"]["timeline"]["tickTransitionSeconds"] = json!("1");
         root["replay"]["rendererGraph"] = json!({
             "columns": [[0, 0, 0], [3, 7, 4], [-1, 0, -1], [-1, -1, -1]],
@@ -1665,7 +2092,7 @@ mod tests {
         root["rendererContract"] = signed(root["rendererContract"].take());
         root["replay"]["rendererContractFingerprint"] =
             root["rendererContract"]["fingerprint"].clone();
-        root["replay"]["entities"][0]["properties"]["type"] = json!([[0, 2], ["unit"], [], []]);
+        root["replay"]["entities"][0]["properties"]["type"] = json!([[0, 2], ["unit"], [], [], []]);
         root["replay"]["rendererGraph"] = json!({
             "columns": [[0, 0, 0], [3, 7, 7], [-1, 0, 1], [-1, -1, -1]],
             "enabled": true,
@@ -1750,7 +2177,7 @@ mod tests {
         root["rendererContract"] = signed(root["rendererContract"].take());
         root["replay"]["rendererContractFingerprint"] =
             root["rendererContract"]["fingerprint"].clone();
-        root["replay"]["entities"][0]["properties"]["type"] = json!([[0, 2], ["unit"], [], []]);
+        root["replay"]["entities"][0]["properties"]["type"] = json!([[0, 2], ["unit"], [], [], []]);
         root["replay"]["rendererGraph"] = json!({
             "columns": [
                 [0, 0, 0, 0, 0],
@@ -1892,12 +2319,12 @@ mod tests {
             root["rendererContract"]["fingerprint"].clone();
 
         let mut first = root["replay"]["entities"][0].take();
-        first["properties"]["type"] = json!([[0, 2], ["b"], [], []]);
+        first["properties"]["type"] = json!([[0, 2], ["b"], [], [], []]);
         let mut second = first.clone();
         second["id"] = json!("two");
-        second["properties"]["type"] = json!([[0, 2], ["a"], [], []]);
+        second["properties"]["type"] = json!([[0, 2], ["a"], [], [], []]);
         root["replay"]["entities"] = Value::Array(vec![first, second]);
-        root["replay"]["objectOrder"] = json!([[0, 2], [["one", "two"]], [], []]);
+        root["replay"]["objectOrder"] = json!([[0, 2], [["one", "two"]], [], [], []]);
         root["replay"]["rendererGraph"] = json!({
             "columns": [
                 [0, 0, 1, 1],

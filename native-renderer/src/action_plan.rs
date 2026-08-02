@@ -31,6 +31,7 @@ pub enum ActionKind {
     FadeIn,
     FadeOut,
     FilterTo,
+    MoveBy,
     MoveTo,
     Repeat,
     RotateBy,
@@ -90,6 +91,7 @@ impl ActionKind {
             Self::FadeIn => "FadeIn",
             Self::FadeOut => "FadeOut",
             Self::FilterTo => "FilterTo",
+            Self::MoveBy => "MoveBy",
             Self::MoveTo => "MoveTo",
             Self::Repeat => "Repeat",
             Self::RotateBy => "RotateBy",
@@ -107,7 +109,7 @@ impl ActionKind {
             Self::DelayTime | Self::FadeIn | Self::FadeOut | Self::Sequence | Self::Spawn => (1, 1),
             Self::Ease | Self::Repeat => (1, 2),
             Self::FilterTo => (4, 4),
-            Self::MoveTo | Self::ScaleTo => (3, 3),
+            Self::MoveBy | Self::MoveTo | Self::ScaleTo => (3, 3),
         }
     }
 }
@@ -202,6 +204,7 @@ impl TryFrom<&str> for ActionKind {
             "FadeIn" => Ok(Self::FadeIn),
             "FadeOut" => Ok(Self::FadeOut),
             "FilterTo" => Ok(Self::FilterTo),
+            "MoveBy" => Ok(Self::MoveBy),
             "MoveTo" => Ok(Self::MoveTo),
             "Repeat" => Ok(Self::Repeat),
             "RotateBy" => Ok(Self::RotateBy),

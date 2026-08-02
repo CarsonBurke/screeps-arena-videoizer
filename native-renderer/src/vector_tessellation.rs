@@ -467,6 +467,7 @@ fn circle_points(center: [f64; 2], radius: [f64; 2], straight: [f64; 2]) -> Resu
         coordinates[first_quadrant] = x - dx;
         first_quadrant += 1;
         coordinates[first_quadrant] = y + dy + ry;
+        first_quadrant += 1;
         fourth_quadrant -= 1;
         coordinates[fourth_quadrant] = y - dy - ry;
         fourth_quadrant -= 1;
@@ -663,7 +664,7 @@ fn push_pair(
 
 #[cfg(test)]
 mod tests {
-    use super::{VectorMesh, arc_segment_count, tessellate_vector_program};
+    use super::{VectorMesh, arc_segment_count, circle_points, tessellate_vector_program};
     use crate::{
         ResolvedValue, VectorCommand, VectorFillStyle, VectorLineStyle, VectorProgram,
         site_progress_program,
@@ -713,6 +714,17 @@ mod tests {
         assert_eq!(arc_segment_count(81.0, 1.0), 9);
         assert_eq!(arc_segment_count(50_000.0, 10.0), 2_048);
         assert_eq!(arc_segment_count(0.0, std::f64::consts::TAU), 40);
+    }
+
+    #[test]
+    fn rounded_rectangle_point_cursors_meet_when_both_straights_are_nonzero() {
+        let points = circle_points([5.0, 3.0], [2.0, 2.0], [3.0, 1.0]).unwrap();
+        assert_eq!(points.len(), 24);
+        assert!(
+            points
+                .iter()
+                .all(|point| point[0].is_finite() && point[1].is_finite())
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+use std::collections::BTreeMap;
 use std::env;
 use std::io::{self, Read};
 use std::num::NonZeroU32;
@@ -8,11 +9,10 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use screeps_arena_native_renderer::{
-    ActionRuntime, AtlasOptions, BoardTransform, GenericSceneRuntime, ProcessorKind, RendererPlan,
-    ReplayArtifact, ResolvedActivation, ResolvedScene, SceneNodeTemplates, SceneSchedule,
-    TerrainDrawPlan, TerrainGeometryCompiler, TerrainPaintStyle, TerrainRasterCache,
-    TerrainRasterStyle, TextureAtlas, Timeline, TimelineEvent, procedural_graphics_assets,
-    vector_graphics_programs,
+    ActionRuntime, AtlasOptions, BoardTransform, GenericSceneRuntime, RendererPlan, ReplayArtifact,
+    ResolvedActivation, ResolvedScene, SceneNodeTemplates, SceneSchedule, TerrainDrawPlan,
+    TerrainGeometryCompiler, TerrainPaintStyle, TerrainRasterCache, TerrainRasterStyle,
+    TextureAtlas, Timeline, TimelineEvent, procedural_graphics_assets, vector_graphics_programs,
 };
 
 fn main() -> ExitCode {
@@ -165,10 +165,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         terrain_draw_operations = Some(draw_operations);
     }
     let mut native_action_handles = 0_u64;
+    let mut processor_activation_counts = BTreeMap::<&str, u64>::new();
     for activation in &resolved_scene.activations {
         let actions = match activation {
-            ResolvedActivation::Processor { actions, .. }
-            | ResolvedActivation::Action { actions, .. } => actions,
+            ResolvedActivation::Processor { kind, actions, .. } => {
+                let count = processor_activation_counts
+                    .entry(kind.as_str())
+                    .or_default();
+                *count = count
+                    .checked_add(1)
+                    .ok_or("processor activation count overflow")?;
+                actions
+            }
+            ResolvedActivation::Action { actions, .. } => actions,
             ResolvedActivation::Object { .. } => continue,
         };
         for action in actions {
@@ -184,23 +193,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Pixi layer ordering and dedicated processor adapters are tracked
     // independently.
     let generic_temporal_benchmark_eligible = artifact.replay.render_config.0.is_some()
-        && resolved_scene.activations.iter().all(|activation| {
-            !matches!(
-                activation,
-                ResolvedActivation::Processor { kind, .. }
-                    if !matches!(
-                        kind,
-                        ProcessorKind::Circle
-                            | ProcessorKind::Container
-                            | ProcessorKind::Draw
-                            | ProcessorKind::ResourceCircle
-                            | ProcessorKind::SiteProgress
-                            | ProcessorKind::Sprite
-                            | ProcessorKind::UserBadge
-                            | ProcessorKind::RunAction
-                    )
-            )
-        });
+        && GenericSceneRuntime::unsupported_processor_kinds(&resolved_scene).is_empty();
     let mut temporal_compile_ms = None;
     let mut temporal_frames = None;
     let mut temporal_batches = None;
@@ -280,6 +273,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "hasDynamicOutputs": renderer_plan.has_dynamic_outputs,
         "objectIntervals": scene_schedule.objects.len(),
         "processorIntervals": scene_schedule.processors.len(),
+        "processorActivationCounts": processor_activation_counts,
         "actionIntervals": scene_schedule.actions.len(),
         "resolvedActivations": resolved_scene.activations.len(),
         "nativeActionHandles": native_action_handles,

@@ -2,18 +2,63 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
-use serde::Deserialize;
 use serde::ser::{SerializeMap, Serializer};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::{Error, Result};
 
 const REPLAY_SCHEMA: &str = "screeps-arena-replay-ir";
-const REPLAY_VERSION: u32 = 7;
+const REPLAY_VERSION: u32 = 8;
 const CONTRACT_SCHEMA: &str = "screeps-arena-renderer-contract";
 const CONTRACT_VERSION: u32 = 5;
 const SHA256_HEX_LENGTH: usize = 64;
+
+#[derive(Default)]
+struct EcmaScriptFormatter;
+
+impl serde_json::ser::Formatter for EcmaScriptFormatter {
+    fn write_i64<W>(&mut self, writer: &mut W, value: i64) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        self.write_f64(writer, value as f64)
+    }
+
+    fn write_u64<W>(&mut self, writer: &mut W, value: u64) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        self.write_f64(writer, value as f64)
+    }
+
+    fn write_f32<W>(&mut self, writer: &mut W, value: f32) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        let mut buffer = ryu_js::Buffer::new();
+        std::io::Write::write_all(writer, buffer.format_finite(value).as_bytes())
+    }
+
+    fn write_f64<W>(&mut self, writer: &mut W, value: f64) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        let mut buffer = ryu_js::Buffer::new();
+        std::io::Write::write_all(writer, buffer.format_finite(value).as_bytes())
+    }
+}
+
+fn ecmascript_json_vec<T>(value: &T) -> Result<Vec<u8>>
+where
+    T: ?Sized + Serialize,
+{
+    let mut bytes = Vec::new();
+    let mut serializer = serde_json::Serializer::with_formatter(&mut bytes, EcmaScriptFormatter);
+    value.serialize(&mut serializer)?;
+    Ok(bytes)
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -156,9 +201,20 @@ pub struct Entity {
     pub calculations: BTreeMap<String, Track>,
 }
 
-/// `[bounds, values, absentIndices, undefinedIndices]`.
+/// `[bounds, values, absentIndices, undefinedIndices, nonFiniteEntries]`.
 #[derive(Debug, Deserialize)]
-pub struct Track(pub Vec<u32>, pub Vec<Value>, pub Vec<u32>, pub Vec<u32>);
+pub struct Track(
+    pub Vec<u32>,
+    pub Vec<Value>,
+    pub Vec<u32>,
+    pub Vec<u32>,
+    pub Vec<NonFiniteEntry>,
+);
+
+/// `[segmentIndex, JSONPointer, numberCode]`, where -1/0/1 encode
+/// -Infinity/NaN/+Infinity and the stored JSON leaf is an unambiguous null.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct NonFiniteEntry(pub u32, pub String, pub i8);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TrackValue<'a> {
@@ -222,7 +278,7 @@ impl ReplayArtifact {
     pub fn from_slice(bytes: &[u8]) -> Result<Self> {
         let canonical_bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
         let value: Value = serde_json::from_slice(canonical_bytes)?;
-        if serde_json::to_vec(&value)? != canonical_bytes {
+        if ecmascript_json_vec(&value)? != canonical_bytes {
             return Err(Error::NonCanonicalJson);
         }
         let root = value
@@ -371,13 +427,21 @@ impl ReplayIr {
         }
 
         for (name, track) in &self.global_state {
-            track.validate(self.total_ticks, false, &format!("globalState.{name}"))?;
+            track.validate(
+                self.total_ticks,
+                false,
+                false,
+                &format!("globalState.{name}"),
+            )?;
         }
         self.object_order
-            .validate(self.total_ticks, true, "objectOrder")?;
-        self.visual_overlay
-            .states
-            .validate(self.total_ticks, true, "visualOverlay.states")?;
+            .validate(self.total_ticks, true, false, "objectOrder")?;
+        self.visual_overlay.states.validate(
+            self.total_ticks,
+            true,
+            false,
+            "visualOverlay.states",
+        )?;
         validate_object_order(&self.object_order)?;
 
         let mut identities = BTreeSet::new();
@@ -402,6 +466,7 @@ impl ReplayIr {
                 track.validate(
                     self.total_ticks,
                     false,
+                    false,
                     &format!("entity {}.{name}", entity.id),
                 )?;
             }
@@ -409,6 +474,7 @@ impl ReplayIr {
                 track.validate(
                     self.total_ticks,
                     false,
+                    true,
                     &format!("entity {} calculation {name}", entity.id),
                 )?;
             }
@@ -594,8 +660,14 @@ impl RendererGraph {
 }
 
 impl Track {
-    fn validate(&self, total_ticks: u32, require_coverage: bool, name: &str) -> Result<()> {
-        let Self(bounds, values, absent, undefined) = self;
+    fn validate(
+        &self,
+        total_ticks: u32,
+        require_coverage: bool,
+        allow_non_finite: bool,
+        name: &str,
+    ) -> Result<()> {
+        let Self(bounds, values, absent, undefined, non_finite) = self;
         if bounds.len() != values.len() * 2 {
             return Err(Error::Invalid(format!("invalid {name} track columns")));
         }
@@ -630,11 +702,34 @@ impl Track {
                 "{name} marks one segment absent and undefined"
             )));
         }
+        let mut previous_index = None::<u32>;
+        let mut segment_pointers = BTreeSet::new();
+        for entry in non_finite {
+            let NonFiniteEntry(index, pointer, code) = entry;
+            if previous_index != Some(*index) {
+                segment_pointers.clear();
+            }
+            if !allow_non_finite
+                || *index as usize >= values.len()
+                || !matches!(*code, -1..=1)
+                || (!pointer.is_empty() && !pointer.starts_with('/'))
+                || previous_index.is_some_and(|previous| previous > *index)
+                || !segment_pointers.insert(pointer.as_str())
+                || absent.binary_search(index).is_ok()
+                || undefined.binary_search(index).is_ok()
+                || json_pointer(&values[*index as usize], pointer) != Some(&Value::Null)
+            {
+                return Err(Error::Invalid(format!(
+                    "invalid {name} non-finite calculation entry"
+                )));
+            }
+            previous_index = Some(*index);
+        }
         Ok(())
     }
 
     pub fn at(&self, tick: u32) -> Option<TrackValue<'_>> {
-        let Self(bounds, values, absent, undefined) = self;
+        let Self(bounds, values, absent, undefined, _) = self;
         let mut low = 0;
         let mut high = values.len();
         let index = loop {
@@ -660,6 +755,65 @@ impl Track {
             Some(TrackValue::Value(&values[index]))
         }
     }
+
+    pub fn non_finite_at(&self, tick: u32) -> Result<Vec<(&str, i8)>> {
+        let Some(index) = self.segment_index_at(tick) else {
+            return Ok(Vec::new());
+        };
+        Ok(self
+            .4
+            .iter()
+            .filter(|entry| entry.0 as usize == index)
+            .map(|entry| (entry.1.as_str(), entry.2))
+            .collect())
+    }
+
+    fn segment_index_at(&self, tick: u32) -> Option<usize> {
+        let mut low = 0;
+        let mut high = self.1.len();
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if tick < self.0[middle * 2] {
+                high = middle;
+            } else if tick >= self.0[middle * 2 + 1] {
+                low = middle + 1;
+            } else {
+                return Some(middle);
+            }
+        }
+        None
+    }
+}
+
+fn json_pointer<'a>(value: &'a Value, pointer: &str) -> Option<&'a Value> {
+    if pointer.is_empty() {
+        return Some(value);
+    }
+    pointer
+        .strip_prefix('/')?
+        .split('/')
+        .try_fold(value, |current, token| {
+            if token.char_indices().any(|(index, character)| {
+                character == '~' && !matches!(token.as_bytes().get(index + 1), Some(b'0' | b'1'))
+            }) {
+                return None;
+            }
+            let token = token.replace("~1", "/").replace("~0", "~");
+            match current {
+                Value::Array(values) => {
+                    let canonical_index = token == "0"
+                        || (!token.starts_with('0')
+                            && !token.is_empty()
+                            && token.bytes().all(|byte| byte.is_ascii_digit()));
+                    canonical_index
+                        .then(|| token.parse::<usize>().ok())
+                        .flatten()
+                        .and_then(|index| values.get(index))
+                }
+                Value::Object(values) => values.get(&token),
+                _ => None,
+            }
+        })
 }
 
 impl Entity {
@@ -773,7 +927,7 @@ fn verify_fingerprint(value: &Value, label: &str) -> Result<()> {
     if !is_sha256(expected) {
         return Err(Error::Invalid(format!("{label} fingerprint is invalid")));
     }
-    let bytes = serde_json::to_vec(&ObjectWithoutFingerprint(object))?;
+    let bytes = ecmascript_json_vec(&ObjectWithoutFingerprint(object))?;
     let actual = encode_hex(Sha256::digest(bytes).as_slice());
     if actual != expected {
         return Err(Error::Invalid(format!("{label} fingerprint mismatch")));
@@ -928,11 +1082,13 @@ pub(crate) mod tests {
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
 
-    use super::{ObjectWithoutFingerprint, ReplayArtifact, TrackValue, encode_hex};
+    use super::{
+        ObjectWithoutFingerprint, ReplayArtifact, TrackValue, ecmascript_json_vec, encode_hex,
+    };
 
     pub(crate) fn signed(mut value: Value) -> Value {
         let object = value.as_object_mut().unwrap();
-        let bytes = serde_json::to_vec(&ObjectWithoutFingerprint(object)).unwrap();
+        let bytes = ecmascript_json_vec(&ObjectWithoutFingerprint(object)).unwrap();
         let fingerprint = encode_hex(Sha256::digest(bytes).as_slice());
         object.insert("fingerprint".to_owned(), Value::String(fingerprint));
         value
@@ -974,7 +1130,7 @@ pub(crate) mod tests {
         let contract_fingerprint = contract["fingerprint"].clone();
         let replay = signed(json!({
             "schema": "screeps-arena-replay-ir",
-            "version": 7,
+            "version": 8,
             "totalTicks": 1,
             "timeline": {
                 "framesPerSecond": "2",
@@ -1023,13 +1179,13 @@ pub(crate) mod tests {
                 "semanticIds": []
             },
             "globalState": {},
-            "visualOverlay": {"enabled": false, "states": [[0, 2], [[]], [], []]},
-            "objectOrder": [[0, 2], [["one"]], [], []],
+            "visualOverlay": {"enabled": false, "states": [[0, 2], [[]], [], [], []]},
+            "objectOrder": [[0, 2], [["one"]], [], [], []],
             "entities": [{
                 "id": "one",
                 "lifetimes": [[0, 2]],
                 "properties": {
-                    "value": [[0, 1, 1, 2], [null, 7], [], [0]]
+                    "value": [[0, 1, 1, 2], [null, 7], [], [0], []]
                 },
                 "calculations": {}
             }],
@@ -1066,6 +1222,45 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn validates_non_finite_calculation_sidecars_only_on_calculation_tracks() {
+        let mut root: Value = serde_json::from_slice(&artifact_json()).unwrap();
+        root["replay"]["calculationOutputs"]["enabled"] = json!(true);
+        root["replay"]["entities"][0]["calculations"]["nan"] =
+            json!([[0, 2], [null], [], [], [[0, "", 0]]]);
+        root["replay"]
+            .as_object_mut()
+            .unwrap()
+            .remove("fingerprint");
+        root["replay"] = signed(root["replay"].take());
+        let artifact = ReplayArtifact::from_slice(&serde_json::to_vec(&root).unwrap()).unwrap();
+        assert_eq!(
+            artifact.replay.entities[0].calculations["nan"]
+                .non_finite_at(1)
+                .unwrap(),
+            vec![("", 0)]
+        );
+
+        let mut invalid = root.clone();
+        invalid["replay"]["entities"][0]["properties"]["value"][4] = json!([[1, "", 0]]);
+        invalid["replay"]
+            .as_object_mut()
+            .unwrap()
+            .remove("fingerprint");
+        invalid["replay"] = signed(invalid["replay"].take());
+        assert!(ReplayArtifact::from_slice(&serde_json::to_vec(&invalid).unwrap()).is_err());
+
+        let mut invalid_path = root;
+        invalid_path["replay"]["entities"][0]["calculations"]["nan"] =
+            json!([[0, 2], [{"a": null}], [], [], [[0, "/a/b", 0]]]);
+        invalid_path["replay"]
+            .as_object_mut()
+            .unwrap()
+            .remove("fingerprint");
+        invalid_path["replay"] = signed(invalid_path["replay"].take());
+        assert!(ReplayArtifact::from_slice(&serde_json::to_vec(&invalid_path).unwrap()).is_err());
+    }
+
+    #[test]
     fn rejects_malformed_function_semantic_fingerprints() {
         let mut root: Value = serde_json::from_slice(&artifact_json()).unwrap();
         root["rendererContract"]["inventory"]["functionSemantics"] =
@@ -1098,6 +1293,22 @@ pub(crate) mod tests {
         assert!(ReplayArtifact::from_slice(&with_newline).is_ok());
         with_newline.push(b'\n');
         assert!(ReplayArtifact::from_slice(&with_newline).is_err());
+    }
+
+    #[test]
+    fn ecmascript_canonicalization_rounds_integer_tokens_to_binary64() {
+        let value: Value = serde_json::from_str("{\"n\":9007199254740993}").unwrap();
+        assert_eq!(
+            ecmascript_json_vec(&value).unwrap(),
+            br#"{"n":9007199254740992}"#
+        );
+
+        let mut artifact: Value = serde_json::from_slice(&artifact_json()).unwrap();
+        artifact["rendererContract"]["metadata"]["unsafeInteger"] = value["n"].clone();
+        assert!(matches!(
+            ReplayArtifact::from_slice(&serde_json::to_vec(&artifact).unwrap()),
+            Err(crate::Error::NonCanonicalJson)
+        ));
     }
 
     #[test]

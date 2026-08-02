@@ -11,6 +11,7 @@ mod action_runtime;
 mod artifact;
 mod assets;
 mod atlas_cache;
+mod creep_actions;
 mod error;
 mod gpu;
 mod layer_compositor;
@@ -34,12 +35,17 @@ mod terrain_gpu;
 mod terrain_paint;
 mod terrain_raster;
 mod terrain_wall;
+mod text_raster;
 mod timeline;
 mod value_plan;
 mod vector_gpu;
 mod vector_graphics;
 mod vector_tessellation;
 mod video;
+#[cfg(target_os = "linux")]
+mod vulkan_external_nv12;
+#[cfg(target_os = "linux")]
+mod vulkan_nvenc;
 
 pub use action_manager::ActionManagerRuntime;
 pub use action_plan::{
@@ -48,8 +54,9 @@ pub use action_plan::{
 };
 pub use action_runtime::{ActionEasing, ActionRuntime, ActionTarget};
 pub use artifact::{
-    BoardFrame, Entity, IndexedReplay, Nullable, RenderConfig, RendererContract, RendererEvent,
-    RendererEventIter, RendererEventOpcode, ReplayArtifact, ReplayIr, Track, TrackValue,
+    BoardFrame, Entity, IndexedReplay, NonFiniteEntry, Nullable, RenderConfig, RendererContract,
+    RendererEvent, RendererEventIter, RendererEventOpcode, ReplayArtifact, ReplayIr, Track,
+    TrackValue,
 };
 pub use assets::{
     AtlasEntry, AtlasOptions, AtlasRasterAsset, TextureAtlas, TextureAtlasPage,
@@ -61,14 +68,16 @@ pub use gpu::{
     EncodedTemporalBatch, FrameConfig, GpuTextureAtlas, LeasedTerrainPhase, PIXI_COLOR_FORMAT,
     PendingTemporalReadback, SPRITE_BLUR_SHADER, SPRITE_SHADER, SpriteBlendMode, SpriteDrawRun,
     SpriteInstance, SpritePipeline, TemporalBatchLease, TemporalRenderBatch,
-    TemporalSpriteRenderer, TemporalSubmission, TemporalTarget, validate_sprite_shader,
+    TemporalSpriteRenderer, TemporalSubmission, TemporalTarget, TemporalTerrainCache,
+    validate_sprite_shader,
 };
 pub use layer_compositor::{
-    LAYER_COMPOSITE_SHADER, TemporalLayerCompositor, validate_layer_composite_shader,
+    LAYER_COMPOSITE_SHADER, TemporalLayerCompositor, TemporalLightingSource,
+    validate_layer_composite_shader,
 };
 pub use nv12::{
-    NV12_SHADER, Nv12BatchConverter, Nv12ReadbackBuffer, Nv12ReadbackLayout,
-    rgba8_to_nv12_reference, validate_nv12_shader,
+    NV12_SHADER, Nv12BatchConverter, Nv12ReadbackBuffer, Nv12ReadbackLayout, PACKED_NV12_SHADER,
+    PackedNv12Converter, rgba8_to_nv12_reference, validate_nv12_shader,
 };
 pub use procedural_graphics::procedural_graphics_assets;
 pub use rational::Rational;
@@ -137,4 +146,12 @@ pub use vector_graphics::{
 pub use vector_tessellation::{
     VectorGeometryId, VectorMesh, VectorVertex, tessellate_vector_program,
 };
-pub use video::{FfmpegVideoEncoder, VideoCodec, VideoEncoderConfig, VideoEncoderStats};
+pub use video::{
+    FfmpegAv1Muxer, FfmpegVideoEncoder, VideoCodec, VideoEncoderConfig, VideoEncoderStats,
+};
+#[cfg(target_os = "linux")]
+pub use vulkan_external_nv12::{VulkanExternalNv12, VulkanExternalNv12Error};
+#[cfg(target_os = "linux")]
+pub use vulkan_nvenc::{
+    EncodedAv1Frame, VulkanNvencConfig, VulkanNvencEncoder, VulkanNvencError, VulkanNvencRing,
+};

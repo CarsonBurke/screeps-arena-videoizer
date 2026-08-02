@@ -20,7 +20,7 @@ impl EntityValueRoots {
         }
         Ok(Self {
             state: resolve_tracks(&entity.properties, tick)?,
-            calculations: resolve_tracks(&entity.calculations, tick)?,
+            calculations: resolve_calculation_tracks(&entity.calculations, tick)?,
             processor_parameters: ResolvedValue::Object(BTreeMap::from([(
                 "tickDuration".to_owned(),
                 ResolvedValue::Number(tick_duration.as_f64()),
@@ -52,13 +52,33 @@ fn resolve_tracks(tracks: &BTreeMap<String, Track>, tick: u32) -> Result<Resolve
     Ok(ResolvedValue::Object(values))
 }
 
+fn resolve_calculation_tracks(
+    tracks: &BTreeMap<String, Track>,
+    tick: u32,
+) -> Result<ResolvedValue> {
+    let values = tracks
+        .iter()
+        .filter_map(|(name, track)| match track.at(tick) {
+            None | Some(TrackValue::Absent) => None,
+            Some(TrackValue::Undefined) => Some(Ok((name.clone(), ResolvedValue::Undefined))),
+            Some(TrackValue::Value(value)) => Some(
+                track
+                    .non_finite_at(tick)
+                    .and_then(|entries| ResolvedValue::from_calculation_json(value, &entries))
+                    .map(|value| (name.clone(), value)),
+            ),
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    Ok(ResolvedValue::Object(values))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
     use serde_json::json;
 
-    use crate::{Entity, EntityValueRoots, Rational, ResolvedValue, Track};
+    use crate::{Entity, EntityValueRoots, NonFiniteEntry, Rational, ResolvedValue, Track};
 
     #[test]
     fn samples_state_calculations_and_explicit_undefined_at_activation_tick() {
@@ -68,15 +88,15 @@ mod tests {
             properties: BTreeMap::from([
                 (
                     "x".to_owned(),
-                    Track(vec![1, 3], vec![json!(12)], vec![], vec![]),
+                    Track(vec![1, 3], vec![json!(12)], vec![], vec![], vec![]),
                 ),
                 (
                     "gone".to_owned(),
-                    Track(vec![1, 3], vec![json!(null)], vec![0], vec![]),
+                    Track(vec![1, 3], vec![json!(null)], vec![0], vec![], vec![]),
                 ),
                 (
                     "unknown".to_owned(),
-                    Track(vec![1, 3], vec![json!(null)], vec![], vec![0]),
+                    Track(vec![1, 3], vec![json!(null)], vec![], vec![0], vec![]),
                 ),
                 (
                     "literal".to_owned(),
@@ -85,12 +105,19 @@ mod tests {
                         vec![json!({"$undefined": true})],
                         vec![],
                         vec![],
+                        vec![],
                     ),
                 ),
             ]),
             calculations: BTreeMap::from([(
                 "height".to_owned(),
-                Track(vec![1, 2, 2, 3], vec![json!(4), json!(5)], vec![], vec![]),
+                Track(
+                    vec![1, 2, 2, 3],
+                    vec![json!(4), json!(5)],
+                    vec![],
+                    vec![],
+                    vec![],
+                ),
             )]),
         };
         let roots = EntityValueRoots::at(&entity, 2, Rational::new(1, 4).unwrap()).unwrap();
@@ -116,5 +143,68 @@ mod tests {
             Some(&ResolvedValue::Number(0.25))
         );
         assert!(EntityValueRoots::at(&entity, 0, Rational::new(1, 4).unwrap()).is_err());
+    }
+
+    #[test]
+    fn decodes_non_finite_numbers_only_from_calculation_tracks() {
+        let entity = Entity {
+            id: "unit".to_owned(),
+            lifetimes: vec![[0, 1]],
+            properties: BTreeMap::from([(
+                "literal".to_owned(),
+                Track(
+                    vec![0, 1],
+                    vec![json!({"$nonFiniteNumber": "NaN"})],
+                    vec![],
+                    vec![],
+                    vec![],
+                ),
+            )]),
+            calculations: BTreeMap::from([
+                (
+                    "nan".to_owned(),
+                    Track(
+                        vec![0, 1],
+                        vec![json!(null)],
+                        vec![],
+                        vec![],
+                        vec![NonFiniteEntry(0, "".to_owned(), 0)],
+                    ),
+                ),
+                (
+                    "nested".to_owned(),
+                    Track(
+                        vec![0, 1],
+                        vec![json!([null])],
+                        vec![],
+                        vec![],
+                        vec![NonFiniteEntry(0, "/0".to_owned(), 1)],
+                    ),
+                ),
+            ]),
+        };
+        let roots = EntityValueRoots::at(&entity, 0, Rational::new(1, 4).unwrap()).unwrap();
+        assert!(
+            roots
+                .calculations
+                .get("nan")
+                .unwrap()
+                .as_number()
+                .unwrap()
+                .is_nan()
+        );
+        assert_eq!(
+            roots.calculations.get("nested"),
+            Some(&ResolvedValue::Array(vec![ResolvedValue::Number(
+                f64::INFINITY
+            )]))
+        );
+        assert_eq!(
+            roots.state.get("literal"),
+            Some(&ResolvedValue::Object(BTreeMap::from([(
+                "$nonFiniteNumber".to_owned(),
+                ResolvedValue::String("NaN".to_owned())
+            )])))
+        );
     }
 }

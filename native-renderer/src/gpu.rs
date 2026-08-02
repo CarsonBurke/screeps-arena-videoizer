@@ -439,6 +439,16 @@ pub struct TemporalRenderBatch<'a> {
     pub compositor: &'a crate::TemporalLayerCompositor,
     pub terrain: &'a crate::TemporalTerrainSceneBatch,
     pub scene: &'a crate::TemporalSceneBatch,
+    pub clear_color: wgpu::Color,
+    /// Optional pre-rendered static terrain prefix and lighting layer. When
+    /// present, `terrain` contains only the ordered dynamic remainder.
+    pub terrain_cache: Option<TemporalTerrainCache<'a>>,
+}
+
+#[derive(Clone, Copy)]
+pub struct TemporalTerrainCache<'a> {
+    pub prefix: &'a TemporalTarget,
+    pub lighting: Option<&'a crate::TemporalLightingSource>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -475,6 +485,7 @@ impl EncodedTemporalBatch {
 pub struct TemporalSubmission<'a> {
     renderer: &'a mut TemporalSpriteRenderer,
     encoder: Option<wgpu::CommandEncoder>,
+    first_slot: usize,
     next_slot: usize,
     submission_id: u64,
 }
@@ -488,14 +499,14 @@ pub struct PendingTemporalReadback<'r> {
 impl SpritePipeline {
     pub const REQUIRED_FEATURES: wgpu::Features = wgpu::Features::MULTIVIEW;
     pub const MIN_VIEWS_PER_BATCH: u32 = 2;
-    /// Portable Vulkan multiview guarantee. Wgpu does not currently expose an
-    /// adapter-specific maximum through `Limits`.
-    pub const MAX_VIEWS_PER_BATCH: u32 = 6;
+    /// Production Vulkan targets support at least this many views; wgpu still
+    /// validates the adapter-specific limit when the pipelines are created.
+    pub const MAX_VIEWS_PER_BATCH: u32 = 8;
     pub const MAX_IN_FLIGHT_BATCHES: u32 = 3;
     /// Main ring targets plus the two shared BlurFilter scratch arrays.
     /// Keeping this bounded prevents valid per-texture dimensions from
     /// exhausting ordinary GPUs before atlas/compositor resources exist.
-    pub const MAX_TEMPORAL_COLOR_BYTES: u64 = 512 * 1024 * 1024;
+    pub const MAX_TEMPORAL_COLOR_BYTES: u64 = 1024 * 1024 * 1024;
 
     pub fn create(
         device: &wgpu::Device,
@@ -1156,6 +1167,7 @@ impl TemporalTarget {
             dimension: wgpu::TextureDimension::D2,
             format,
             usage: wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST
                 | wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
@@ -1316,6 +1328,19 @@ impl TemporalSpriteRenderer {
         &'a mut self,
         device: &wgpu::Device,
     ) -> Result<TemporalSubmission<'a>> {
+        self.begin_submission_at(device, 0)
+    }
+
+    pub fn begin_submission_at<'a>(
+        &'a mut self,
+        device: &wgpu::Device,
+        first_slot: usize,
+    ) -> Result<TemporalSubmission<'a>> {
+        if first_slot >= self.slot_count() {
+            return Err(Error::Invalid(format!(
+                "temporal submission starts at invalid slot {first_slot}"
+            )));
+        }
         let submission_id = next_identity(&TEMPORAL_SUBMISSION_ID)?;
         Ok(TemporalSubmission {
             renderer: self,
@@ -1324,7 +1349,8 @@ impl TemporalSpriteRenderer {
                     label: Some("temporal frame submission"),
                 }),
             ),
-            next_slot: 0,
+            first_slot,
+            next_slot: first_slot,
             submission_id,
         })
     }
@@ -1530,6 +1556,45 @@ impl TemporalSpriteRenderer {
     }
 }
 
+fn validate_cached_target(cache: &TemporalTarget, target: &TemporalTarget) -> Result<()> {
+    if cache.width != target.width
+        || cache.height != target.height
+        || cache.layers != target.layers
+        || cache.format != target.format
+    {
+        return Err(Error::Invalid(
+            "cached terrain target differs from the temporal scene target".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn copy_temporal_target(
+    encoder: &mut wgpu::CommandEncoder,
+    source: &TemporalTarget,
+    destination: &TemporalTarget,
+) {
+    encoder.copy_texture_to_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &source.texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyTextureInfo {
+            texture: &destination.texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::Extent3d {
+            width: source.width,
+            height: source.height,
+            depth_or_array_layers: source.layers.get(),
+        },
+    );
+}
+
 impl TemporalSubmission<'_> {
     pub fn lease_batch(&mut self) -> Result<TemporalBatchLease> {
         let slot_index = self.next_slot;
@@ -1611,29 +1676,7 @@ impl TemporalSubmission<'_> {
         validate_draw_runs(&batch.draw_runs, batch.instances_per_view)?;
         let runs = activation_orders
             .iter()
-            .map(|activation_order| {
-                let slot = batch
-                    .slot_activations
-                    .iter()
-                    .position(|activation| activation == activation_order)
-                    .ok_or_else(|| {
-                        Error::Invalid(format!(
-                            "temporal sprite batch lacks activation {activation_order}"
-                        ))
-                    })?;
-                let slot = u32::try_from(slot).map_err(|_| Error::ArithmeticOverflow)?;
-                let containing = batch
-                    .draw_runs
-                    .iter()
-                    .find(|run| run.instances.contains(&slot))
-                    .expect("validated draw runs cover every sprite slot");
-                Ok(SpriteDrawRun {
-                    layer_order: containing.layer_order,
-                    blend_mode: containing.blend_mode,
-                    has_blur_filter: containing.has_blur_filter,
-                    instances: slot..slot + 1,
-                })
-            })
+            .map(|activation_order| sprite_activation_run(batch, *activation_order))
             .collect::<Result<Vec<_>>>()?;
         let encoder = self
             .encoder
@@ -1772,6 +1815,8 @@ impl TemporalSubmission<'_> {
             compositor,
             terrain,
             scene,
+            clear_color,
+            terrain_cache,
         } = parameters;
         if !vector_pipeline.is_compatible_renderer(self.renderer)
             || scene.sprites.active_views != scene.vectors.active_views
@@ -1780,15 +1825,20 @@ impl TemporalSubmission<'_> {
                 "combined terrain scene has incompatible renderer or active views".to_owned(),
             ));
         }
-        let lighting_composite_supported = matches!(
-            (terrain.lighting.is_some(), terrain.lighting_composite),
-            (true, Some(composite))
-                if composite.alpha == 1.0
-                    && composite.blend_mode == SpriteBlendMode::Multiply
-        ) || matches!(
-            (terrain.lighting.is_some(), terrain.lighting_composite),
-            (false, None)
-        );
+        let resident_lighting = terrain_cache.and_then(|cache| cache.lighting);
+        if resident_lighting.is_some() && terrain.lighting.is_some() {
+            return Err(Error::Invalid(
+                "resident and dynamic terrain lighting cannot be supplied together".to_owned(),
+            ));
+        }
+        let has_lighting = resident_lighting.is_some() || terrain.lighting.is_some();
+        let lighting_composite_supported =
+            matches!(
+                (has_lighting, terrain.lighting_composite),
+                (true, Some(composite))
+                    if composite.alpha == 1.0
+                        && composite.blend_mode == SpriteBlendMode::Multiply
+            ) || matches!((has_lighting, terrain.lighting_composite), (false, None));
         if !lighting_composite_supported {
             return Err(Error::Invalid(
                 "terrain lighting phase and composite are inconsistent".to_owned(),
@@ -1834,7 +1884,18 @@ impl TemporalSubmission<'_> {
             }
         }
         let lease = self.lease_batch()?;
-        let mut scene_load = wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT);
+        let mut scene_load = if let Some(cache) = terrain_cache {
+            let target = &self.renderer.slots[lease.slot_index].target;
+            validate_cached_target(cache.prefix, target)?;
+            let encoder = self
+                .encoder
+                .as_mut()
+                .expect("submission retains its encoder until submit");
+            copy_temporal_target(encoder, cache.prefix, target);
+            wgpu::LoadOp::Load
+        } else {
+            wgpu::LoadOp::Clear(clear_color)
+        };
         for phase in [&terrain.terrain, &terrain.wall_graffiti]
             .into_iter()
             .flatten()
@@ -1854,7 +1915,19 @@ impl TemporalSubmission<'_> {
         }
         let encoded =
             self.encode_leased_scene_batch(queue, vector_pipeline, lease, scene, scene_load)?;
-        if let Some(lighting) = &terrain.lighting {
+        if let Some(source) = resident_lighting {
+            let target = &self.renderer.slots[encoded.slot_index].target;
+            let encoder = self
+                .encoder
+                .as_mut()
+                .expect("submission retains its encoder until submit");
+            compositor.encode_resident_lighting_composite_into(
+                encoder,
+                source,
+                target,
+                wgpu::LoadOp::Load,
+            )?;
+        } else if let Some(lighting) = &terrain.lighting {
             let target = compositor.lighting_target(&encoded)?;
             if lighting.frame.output_size != [target.width as f32, target.height as f32]
                 || lighting.frame.active_views > target.layers.get()
@@ -1881,7 +1954,7 @@ impl TemporalSubmission<'_> {
                 },
             )?;
         }
-        if terrain.lighting.is_some() {
+        if has_lighting && resident_lighting.is_none() {
             self.encode_lighting_composite(compositor, &encoded, wgpu::LoadOp::Load)?;
         }
         if let Some(effects) = &terrain.effects {
@@ -1928,6 +2001,53 @@ impl TemporalSubmission<'_> {
             submission_id: self.submission_id,
             copy,
         })
+    }
+
+    /// Convert a completed temporal batch to GPU-resident NV12 without
+    /// scheduling a host readback. Hardware encoders and throughput probes use
+    /// this boundary so conversion can remain in the same command submission
+    /// as rendering.
+    pub fn encode_nv12(
+        &mut self,
+        batch: &EncodedTemporalBatch,
+        converter: &crate::Nv12BatchConverter,
+    ) -> Result<()> {
+        self.validate_encoded_batch(batch)?;
+        let target = &self.renderer.slots[batch.slot_index].target;
+        if converter.source_identity() != target.identity {
+            return Err(Error::Invalid(
+                "NV12 converter belongs to another temporal target".to_owned(),
+            ));
+        }
+        let encoder = self
+            .encoder
+            .as_mut()
+            .expect("submission retains its encoder until submit");
+        converter.encode(encoder);
+        Ok(())
+    }
+
+    /// Convert each active temporal layer into an independent packed R8 NV12
+    /// target. The destination order is the temporal frame order, allowing a
+    /// ring of exportable Vulkan images to be handed directly to CUDA/NVENC.
+    pub fn encode_packed_nv12(
+        &mut self,
+        batch: &EncodedTemporalBatch,
+        converter: &crate::PackedNv12Converter,
+        destinations: &[&wgpu::TextureView],
+    ) -> Result<()> {
+        self.validate_encoded_batch(batch)?;
+        let target = &self.renderer.slots[batch.slot_index].target;
+        if converter.source_identity() != target.identity {
+            return Err(Error::Invalid(
+                "packed NV12 converter belongs to another temporal target".to_owned(),
+            ));
+        }
+        let encoder = self
+            .encoder
+            .as_mut()
+            .expect("submission retains its encoder until submit");
+        converter.encode(encoder, destinations, batch.active_layers.end)
     }
 
     pub fn encode_batch(
@@ -1995,9 +2115,9 @@ impl TemporalSubmission<'_> {
         let mut display_sprites = BTreeSet::new();
         let mut display_vectors = BTreeSet::new();
         for entry in &batch.display_order {
-            if !seen.insert(entry.activation_order) {
+            if !seen.insert((entry.activation_order, entry.kind)) {
                 return Err(Error::Invalid(
-                    "heterogeneous scene display order repeats an activation".to_owned(),
+                    "heterogeneous scene display order repeats a drawable identity".to_owned(),
                 ));
             }
             match entry.kind {
@@ -2108,7 +2228,7 @@ impl TemporalSubmission<'_> {
                 "temporal batch lease belongs to another submission".to_owned(),
             ));
         }
-        if lease.slot_index >= self.next_slot {
+        if lease.slot_index < self.first_slot || lease.slot_index >= self.next_slot {
             return Err(Error::Invalid(format!(
                 "temporal batch slot {} is not leased in this submission",
                 lease.slot_index
@@ -2123,7 +2243,7 @@ impl TemporalSubmission<'_> {
                 "temporal batch handle belongs to another submission".to_owned(),
             ));
         }
-        if batch.slot_index >= self.next_slot {
+        if batch.slot_index < self.first_slot || batch.slot_index >= self.next_slot {
             return Err(Error::Invalid(format!(
                 "temporal batch slot {} has not been leased in this submission",
                 batch.slot_index
@@ -2157,6 +2277,33 @@ impl TemporalSubmission<'_> {
             .expect("temporal submission can only be submitted once");
         let submission = queue.submit(Some(encoder.finish()));
         pending.copy.read(device, submission)
+    }
+
+    /// Submit this temporal batch and visit each tightly packed NV12 frame in
+    /// temporal-layer order. Frames borrow mapped readback memory when its
+    /// layout is already contiguous; padded rows share one reusable scratch
+    /// buffer. The mapped GPU buffer is always unmapped before this returns.
+    pub fn submit_and_visit_nv12<F>(
+        mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pending: PendingTemporalReadback<'_>,
+        visitor: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[u8]) -> Result<()>,
+    {
+        if pending.submission_id != self.submission_id {
+            return Err(Error::Invalid(
+                "NV12 readback belongs to another temporal submission".to_owned(),
+            ));
+        }
+        let encoder = self
+            .encoder
+            .take()
+            .expect("temporal submission can only be submitted once");
+        let submission = queue.submit(Some(encoder.finish()));
+        pending.copy.visit(device, submission, visitor)
     }
 }
 
@@ -2205,6 +2352,33 @@ fn validate_temporal_color_budget(
         )));
     }
     Ok(())
+}
+
+fn sprite_activation_run(
+    batch: &EncodedTemporalBatch,
+    activation_order: u32,
+) -> Result<SpriteDrawRun> {
+    let slot = batch
+        .slot_activations
+        .iter()
+        .position(|activation| *activation == activation_order)
+        .ok_or_else(|| {
+            Error::Invalid(format!(
+                "temporal sprite batch lacks activation {activation_order}"
+            ))
+        })?;
+    let slot = u32::try_from(slot).map_err(|_| Error::ArithmeticOverflow)?;
+    let containing = batch
+        .draw_runs
+        .iter()
+        .find(|run| run.instances.contains(&slot))
+        .expect("validated draw runs cover every sprite slot");
+    Ok(SpriteDrawRun {
+        layer_order: containing.layer_order,
+        blend_mode: containing.blend_mode,
+        has_blur_filter: containing.has_blur_filter,
+        instances: slot..slot + 1,
+    })
 }
 
 fn validate_draw_runs(draw_runs: &[SpriteDrawRun], instances_per_view: u32) -> Result<()> {
@@ -2437,11 +2611,16 @@ mod tests {
 
     #[test]
     fn rejects_backend_invalid_multiview_counts() {
-        for valid in 2..=6 {
+        for valid in SpritePipeline::MIN_VIEWS_PER_BATCH..=SpritePipeline::MAX_VIEWS_PER_BATCH {
             validate_multiview_count(NonZeroU32::new(valid).unwrap()).unwrap();
         }
         assert!(validate_multiview_count(NonZeroU32::new(1).unwrap()).is_err());
-        assert!(validate_multiview_count(NonZeroU32::new(7).unwrap()).is_err());
+        assert!(
+            validate_multiview_count(
+                NonZeroU32::new(SpritePipeline::MAX_VIEWS_PER_BATCH + 1).unwrap()
+            )
+            .is_err()
+        );
         for valid in 1..=SpritePipeline::MAX_IN_FLIGHT_BATCHES {
             validate_in_flight_batches(NonZeroU32::new(valid).unwrap()).unwrap();
         }
@@ -2455,7 +2634,7 @@ mod tests {
 
     #[test]
     fn bounds_shared_temporal_color_targets_and_blur_offsets() {
-        let views = NonZeroU32::new(6).unwrap();
+        let views = NonZeroU32::new(SpritePipeline::MAX_VIEWS_PER_BATCH).unwrap();
         let slots = NonZeroU32::new(3).unwrap();
         validate_temporal_color_budget(1920, 1080, views, slots).unwrap();
         assert!(validate_temporal_color_budget(3840, 2160, views, slots).is_err());

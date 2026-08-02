@@ -284,6 +284,16 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let instance = instances[
         input.view_index * frame.instances_per_view + input.instance_index
     ];
+    var mask_coverage = 1.0;
+    if instance.mask_info.y != 0u {
+        mask_coverage = mask_sample(instance.mask_info.x, input.corner)
+            * instance.alpha_mask.y;
+        // A masked tiler covers the whole board geometrically. Reject empty
+        // mask texels before its substantially more expensive atlas sample.
+        if mask_coverage == 0.0 {
+            discard;
+        }
+    }
     let kind = instance.source_layers.x;
     var color = vec4<f32>(0.0);
     if kind == 0u {
@@ -334,11 +344,7 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
             i32(instance.source_layers.z),
         );
     }
-    if instance.mask_info.y != 0u {
-        let coverage = mask_sample(instance.mask_info.x, input.corner)
-            * instance.alpha_mask.y;
-        color *= coverage;
-    }
+    color *= mask_coverage;
     let alpha = instance.alpha_mask.x;
     return vec4<f32>(color.rgb * alpha, color.a * alpha);
 }
@@ -514,6 +520,42 @@ impl TemporalTerrainSceneBatch {
 }
 
 impl TemporalTerrainBatch {
+    /// Conservative per-view slot capacity covering any blend-topology union
+    /// formed by one bounded temporal batch. Summing the largest possible
+    /// number of distinct plan lengths is independent of frame order without
+    /// making allocation proportional to the whole replay.
+    pub fn topology_slot_capacity_per_view<'a>(
+        plans: impl IntoIterator<Item = &'a TerrainDrawPlan>,
+        views_per_batch: NonZeroU32,
+    ) -> Result<u32> {
+        let plans = plans.into_iter().collect::<Vec<_>>();
+        let maximum = [
+            TerrainDrawPhase::Terrain,
+            TerrainDrawPhase::WallGraffiti,
+            TerrainDrawPhase::Lighting,
+            TerrainDrawPhase::Effects,
+        ]
+        .into_iter()
+        .map(|phase| {
+            let mut lengths = plans
+                .iter()
+                .map(|plan| phase_operations(plan, phase).len())
+                .collect::<Vec<_>>();
+            lengths.sort_unstable_by(|left, right| right.cmp(left));
+            lengths
+                .into_iter()
+                .take(views_per_batch.get() as usize)
+                .try_fold(0usize, |total, length| {
+                    total.checked_add(length).ok_or(Error::ArithmeticOverflow)
+                })
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+        u32::try_from(maximum).map_err(|_| Error::ArithmeticOverflow)
+    }
+
     pub fn compile_phase(
         views: &[(&TerrainDrawPlan, &TerrainMaskBindings, BoardTransform)],
         phase: TerrainDrawPhase,
@@ -531,55 +573,49 @@ impl TemporalTerrainBatch {
                 "terrain temporal batch dimensions are invalid".to_owned(),
             ));
         }
-        let reference = phase_operations(views[0].0, phase);
-        if reference.is_empty() {
-            if views
-                .iter()
-                .skip(1)
-                .any(|(plan, _, _)| !phase_operations(plan, phase).is_empty())
-            {
-                return Err(Error::Invalid(
-                    "terrain phase topology changes across temporal views".to_owned(),
-                ));
-            }
+        let plans = views.iter().map(|(plan, _, _)| *plan).collect::<Vec<_>>();
+        let topology = merged_phase_blends(&plans, phase);
+        if topology.is_empty() {
             return Ok(None);
         }
         let operation_count =
-            u32::try_from(reference.len()).map_err(|_| Error::ArithmeticOverflow)?;
+            u32::try_from(topology.len()).map_err(|_| Error::ArithmeticOverflow)?;
         let mut instances = Vec::with_capacity(
             (configured_views.get() as usize)
-                .checked_mul(reference.len())
+                .checked_mul(topology.len())
                 .ok_or(Error::ArithmeticOverflow)?,
         );
         for (plan, bindings, board) in views {
             let operations = phase_operations(plan, phase);
-            if operations.len() != reference.len()
-                || operations
-                    .iter()
-                    .zip(reference)
-                    .any(|(operation, expected)| operation.blend_mode != expected.blend_mode)
-            {
+            let mut next_operation = 0;
+            for blend_mode in &topology {
+                if operations
+                    .get(next_operation)
+                    .is_some_and(|operation| operation.blend_mode == *blend_mode)
+                {
+                    instances.push(TerrainGpuInstance::compile(
+                        &operations[next_operation],
+                        bindings,
+                        atlas,
+                        *board,
+                    )?);
+                    next_operation += 1;
+                } else {
+                    instances.push(TerrainGpuInstance::zeroed());
+                }
+            }
+            if next_operation != operations.len() {
                 return Err(Error::Invalid(
-                    "terrain phase topology or blends change across temporal views".to_owned(),
+                    "terrain phase blend topology could not be merged".to_owned(),
                 ));
             }
-            for operation in operations {
-                instances.push(TerrainGpuInstance::compile(
-                    operation, bindings, atlas, *board,
-                )?);
-            }
         }
-        let first_view = instances[..reference.len()].to_vec();
         while instances.len()
             < (configured_views.get() as usize)
-                .checked_mul(reference.len())
+                .checked_mul(topology.len())
                 .ok_or(Error::ArithmeticOverflow)?
         {
-            instances.extend(first_view.iter().map(|instance| {
-                let mut instance = *instance;
-                instance.alpha_mask[0] = 0.0;
-                instance
-            }));
+            instances.extend((0..topology.len()).map(|_| TerrainGpuInstance::zeroed()));
         }
         Ok(Some(Self {
             instances,
@@ -588,7 +624,7 @@ impl TemporalTerrainBatch {
                 active_views: u32::try_from(views.len()).map_err(|_| Error::ArithmeticOverflow)?,
                 output_size: [output_size[0] as f32, output_size[1] as f32],
             },
-            runs: blend_runs(reference)?,
+            runs: blend_mode_runs(&topology)?,
         }))
     }
 }
@@ -1005,6 +1041,16 @@ impl TerrainCommandUploads {
     pub fn remaining_passes(&self) -> u32 {
         self.pass_capacity - self.next_pass
     }
+
+    /// Reuse this upload arena after the command submission containing all of
+    /// its recorded copies has completed on the GPU.
+    ///
+    /// Callers must not reset while any submission referencing these upload
+    /// ranges remains in flight. A blocking readback of that submission is a
+    /// sufficient completion boundary.
+    pub fn reset_after_gpu_completion(&mut self) {
+        self.next_pass = 0;
+    }
 }
 
 fn validate_bank_extents(mask: [u32; 2], wall: [u32; 2], blur: [u32; 2]) -> Result<()> {
@@ -1052,17 +1098,69 @@ fn phase_operations(plan: &TerrainDrawPlan, phase: TerrainDrawPhase) -> &[Terrai
     }
 }
 
-fn blend_runs(operations: &[TerrainDrawOp]) -> Result<Vec<(SpriteBlendMode, Range<u32>)>> {
+fn merged_phase_blends(
+    plans: &[&TerrainDrawPlan],
+    phase: TerrainDrawPhase,
+) -> Vec<SpriteBlendMode> {
+    plans.iter().fold(Vec::new(), |topology, plan| {
+        merge_blend_sequences(
+            &topology,
+            &phase_operations(plan, phase)
+                .iter()
+                .map(|operation| operation.blend_mode)
+                .collect::<Vec<_>>(),
+        )
+    })
+}
+
+fn merge_blend_sequences(
+    left: &[SpriteBlendMode],
+    right: &[SpriteBlendMode],
+) -> Vec<SpriteBlendMode> {
+    let mut common_suffix = vec![vec![0usize; right.len() + 1]; left.len() + 1];
+    for left_index in (0..left.len()).rev() {
+        for right_index in (0..right.len()).rev() {
+            common_suffix[left_index][right_index] = if left[left_index] == right[right_index] {
+                common_suffix[left_index + 1][right_index + 1] + 1
+            } else {
+                common_suffix[left_index + 1][right_index]
+                    .max(common_suffix[left_index][right_index + 1])
+            };
+        }
+    }
+    let mut merged = Vec::with_capacity(left.len() + right.len());
+    let (mut left_index, mut right_index) = (0, 0);
+    while left_index < left.len() && right_index < right.len() {
+        if left[left_index] == right[right_index] {
+            merged.push(left[left_index]);
+            left_index += 1;
+            right_index += 1;
+        } else if common_suffix[left_index + 1][right_index]
+            >= common_suffix[left_index][right_index + 1]
+        {
+            merged.push(left[left_index]);
+            left_index += 1;
+        } else {
+            merged.push(right[right_index]);
+            right_index += 1;
+        }
+    }
+    merged.extend_from_slice(&left[left_index..]);
+    merged.extend_from_slice(&right[right_index..]);
+    merged
+}
+
+fn blend_mode_runs(blend_modes: &[SpriteBlendMode]) -> Result<Vec<(SpriteBlendMode, Range<u32>)>> {
     let mut runs = Vec::<(SpriteBlendMode, Range<u32>)>::new();
-    for (index, operation) in operations.iter().enumerate() {
+    for (index, blend_mode) in blend_modes.iter().copied().enumerate() {
         let index = u32::try_from(index).map_err(|_| Error::ArithmeticOverflow)?;
-        if let Some((blend_mode, range)) = runs.last_mut()
-            && *blend_mode == operation.blend_mode
+        if let Some((previous_blend, range)) = runs.last_mut()
+            && *previous_blend == blend_mode
         {
             range.end = index.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
         } else {
             runs.push((
-                operation.blend_mode,
+                blend_mode,
                 index..index.checked_add(1).ok_or(Error::ArithmeticOverflow)?,
             ));
         }
@@ -2205,18 +2303,73 @@ mod tests {
         assert_eq!(batch.runs, vec![(SpriteBlendMode::Normal, 0..1)]);
 
         let incompatible = solid_plan(SpriteBlendMode::Add);
-        assert!(
-            TemporalTerrainBatch::compile_phase(
-                &[
-                    (&first, &bindings, board),
-                    (&incompatible, &bindings, board)
-                ],
-                TerrainDrawPhase::Terrain,
-                &atlas,
+        let mixed = TemporalTerrainBatch::compile_phase(
+            &[
+                (&first, &bindings, board),
+                (&incompatible, &bindings, board),
+            ],
+            TerrainDrawPhase::Terrain,
+            &atlas,
+            NonZeroU32::new(2).unwrap(),
+            [640, 480],
+        );
+        let mixed = mixed.unwrap().unwrap();
+        assert_eq!(mixed.frame.instances_per_view, 2);
+        assert_eq!(
+            mixed.runs,
+            vec![
+                (SpriteBlendMode::Normal, 0..1),
+                (SpriteBlendMode::Add, 1..2)
+            ]
+        );
+        assert_eq!(
+            mixed
+                .instances
+                .iter()
+                .map(|instance| instance.alpha_mask[0])
+                .collect::<Vec<_>>(),
+            vec![1.0, 0.0, 0.0, 1.0]
+        );
+
+        let mut rampart_appears = solid_plan(SpriteBlendMode::Normal);
+        let mut rampart = rampart_appears.terrain[0].clone();
+        rampart.phase = TerrainDrawPhase::Effects;
+        rampart.blend_mode = SpriteBlendMode::Add;
+        rampart_appears.effects.push(rampart);
+        let effects = TemporalTerrainBatch::compile_phase(
+            &[
+                (&first, &bindings, board),
+                (&rampart_appears, &bindings, board),
+            ],
+            TerrainDrawPhase::Effects,
+            &atlas,
+            NonZeroU32::new(2).unwrap(),
+            [640, 480],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(effects.frame.instances_per_view, 1);
+        assert_eq!(effects.runs, vec![(SpriteBlendMode::Add, 0..1)]);
+        assert_eq!(effects.instances[0].alpha_mask[0], 0.0);
+        assert_eq!(effects.instances[1].alpha_mask[0], 1.0);
+        assert_eq!(
+            TemporalTerrainBatch::topology_slot_capacity_per_view(
+                [&first, &incompatible],
                 NonZeroU32::new(2).unwrap(),
-                [640, 480],
             )
-            .is_err()
+            .unwrap(),
+            2
+        );
+        let many_plans = (0..100)
+            .map(|_| solid_plan(SpriteBlendMode::Normal))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            TemporalTerrainBatch::topology_slot_capacity_per_view(
+                many_plans.iter(),
+                NonZeroU32::new(6).unwrap(),
+            )
+            .unwrap(),
+            6
         );
     }
 }

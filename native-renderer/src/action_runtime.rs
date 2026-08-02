@@ -63,6 +63,12 @@ pub enum ActionRuntime {
         target: f64,
         clock: TimeableClock,
     },
+    MoveBy {
+        x: f64,
+        y: f64,
+        destination: Option<[f64; 2]>,
+        clock: TimeableClock,
+    },
     MoveTo {
         x: f64,
         y: f64,
@@ -185,6 +191,12 @@ impl ActionRuntime {
                     clock: timeable(params, 3, node.kind)?,
                 }
             }
+            ActionKind::MoveBy => Self::MoveBy {
+                x: number(value_param(params, 0, node.kind)?, "MoveBy x")?,
+                y: number(value_param(params, 1, node.kind)?, "MoveBy y")?,
+                destination: None,
+                clock: timeable(params, 2, node.kind)?,
+            },
             ActionKind::MoveTo => Self::MoveTo {
                 x: number(value_param(params, 0, node.kind)?, "MoveTo x")?,
                 y: number(value_param(params, 1, node.kind)?, "MoveTo y")?,
@@ -321,6 +333,24 @@ impl ActionRuntime {
                 );
                 if clock.advance(delta_ms) {
                     filter.insert(property.clone(), *destination);
+                    clock.reset();
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+            Self::MoveBy {
+                x,
+                y,
+                destination,
+                clock,
+            } => {
+                let destination = *destination.get_or_insert([target.x + *x, target.y + *y]);
+                target.x = interpolate(target.x, destination[0], *clock, delta_ms);
+                target.y = interpolate(target.y, destination[1], *clock, delta_ms);
+                if clock.advance(delta_ms) {
+                    target.x = destination[0];
+                    target.y = destination[1];
                     clock.reset();
                     Ok(true)
                 } else {
@@ -479,6 +509,12 @@ impl ActionRuntime {
                 target.x = *x;
                 target.y = *y;
             }
+            Self::MoveBy { destination, .. } => {
+                if let Some(destination) = destination {
+                    target.x = destination[0];
+                    target.y = destination[1];
+                }
+            }
             Self::Repeat { .. } | Self::Sequence { .. } | Self::Spawn { .. } => {}
             Self::RotateBy {
                 target_rotation, ..
@@ -529,6 +565,12 @@ impl ActionRuntime {
                 clock.reset();
                 *target_rotation = None;
             }
+            Self::MoveBy {
+                destination, clock, ..
+            } => {
+                clock.reset();
+                *destination = None;
+            }
             Self::Sequence { index, .. } => *index = 0,
             Self::Spawn { active, .. } => active.fill(true),
         }
@@ -540,6 +582,7 @@ impl ActionRuntime {
             | Self::DelayTime { clock }
             | Self::FadeIn { clock, .. }
             | Self::FilterTo { clock, .. }
+            | Self::MoveBy { clock, .. }
             | Self::MoveTo { clock, .. }
             | Self::RotateBy { clock, .. }
             | Self::RotateTo { clock, .. }

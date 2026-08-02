@@ -89,6 +89,21 @@ pub struct FfmpegVideoEncoder {
     failed: bool,
 }
 
+/// Streams low-overhead AV1 OBUs produced by the direct NVENC path into an
+/// FFmpeg stream-copy muxer. FFmpeg never decodes or re-encodes the frames; it
+/// only builds the MP4 container and publishes it atomically on success.
+#[must_use = "the muxer must be finished to flush and validate the video"]
+pub struct FfmpegAv1Muxer {
+    child: Option<Child>,
+    stdin: Option<ChildStdin>,
+    stderr_reader: Option<JoinHandle<std::io::Result<Vec<u8>>>>,
+    output: std::path::PathBuf,
+    temporary_output: std::path::PathBuf,
+    overwrite: bool,
+    bytes: u64,
+    failed: bool,
+}
+
 struct ReapRequest {
     child: Child,
     stderr_reader: Option<JoinHandle<std::io::Result<Vec<u8>>>>,
@@ -143,6 +158,14 @@ impl FfmpegVideoEncoder {
             &dimensions,
             "-framerate",
             &frame_rate,
+            "-colorspace",
+            "bt709",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
+            "-color_range",
+            "tv",
             "-i",
             "pipe:0",
             "-an",
@@ -338,27 +361,7 @@ impl FfmpegVideoEncoder {
             .frames
             .checked_mul(self.frame_bytes as u64)
             .ok_or(Error::ArithmeticOverflow)?;
-        if self.overwrite {
-            fs::rename(&self.temporary_output, &self.output)?;
-        } else {
-            // A same-directory hard link publishes the complete inode
-            // atomically and fails instead of clobbering a path that appeared
-            // after the initial existence check.
-            fs::hard_link(&self.temporary_output, &self.output).map_err(|error| {
-                let _ = fs::remove_file(&self.temporary_output);
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    Error::Invalid(format!(
-                        "video output appeared while encoding: {}",
-                        self.output.display()
-                    ))
-                } else {
-                    Error::Io(error)
-                }
-            })?;
-            // The complete output is already atomically published. A stale
-            // hidden link is cleanup debt, not an encoding failure.
-            let _ = fs::remove_file(&self.temporary_output);
-        }
+        publish_output(&self.temporary_output, &self.output, self.overwrite)?;
         Ok(VideoEncoderStats {
             frames: self.frames,
             bytes,
@@ -376,6 +379,238 @@ impl FfmpegVideoEncoder {
 }
 
 impl Drop for FfmpegVideoEncoder {
+    fn drop(&mut self) {
+        drop(self.stdin.take());
+        if let Some(child) = self.child.take() {
+            defer_terminate_child(child, self.stderr_reader.take());
+        } else if let Some(reader) = self.stderr_reader.take() {
+            let _ = reader.join();
+        }
+        let _ = fs::remove_file(&self.temporary_output);
+    }
+}
+
+impl FfmpegAv1Muxer {
+    pub fn spawn(
+        output: impl AsRef<Path>,
+        frames_per_second: Rational,
+        overwrite: bool,
+    ) -> Result<Self> {
+        Self::spawn_with_program("ffmpeg", output, frames_per_second, overwrite)
+    }
+
+    fn spawn_with_program(
+        program: impl AsRef<OsStr>,
+        output: impl AsRef<Path>,
+        frames_per_second: Rational,
+        overwrite: bool,
+    ) -> Result<Self> {
+        if frames_per_second == Rational::ZERO {
+            return Err(Error::Invalid(
+                "video frame rate must be positive".to_owned(),
+            ));
+        }
+        let output = output.as_ref();
+        if output.as_os_str().is_empty() {
+            return Err(Error::Invalid(
+                "video output path cannot be empty".to_owned(),
+            ));
+        }
+        if !overwrite && output.exists() {
+            return Err(Error::Invalid(format!(
+                "video output already exists: {}",
+                output.display()
+            )));
+        }
+        drop(reaper_sender()?);
+        let temporary_output = temporary_output_path(output)?;
+        let frame_rate = format!(
+            "{}/{}",
+            frames_per_second.numerator(),
+            frames_per_second.denominator()
+        );
+        let mut command = Command::new(program);
+        command.args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            if overwrite { "-y" } else { "-n" },
+            "-framerate",
+            &frame_rate,
+            "-f",
+            "obu",
+            "-i",
+            "pipe:0",
+            "-an",
+            "-c:v",
+            "copy",
+            "-color_range",
+            "tv",
+            "-colorspace",
+            "bt709",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
+            "-movflags",
+            "+faststart",
+        ]);
+        command
+            .arg(&temporary_output)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn()?;
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                terminate_child(&mut child, None);
+                let _ = fs::remove_file(&temporary_output);
+                return Err(Error::Invalid(
+                    "FFmpeg process did not expose a stdin pipe".to_owned(),
+                ));
+            }
+        };
+        let mut stderr = match child.stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                drop(stdin);
+                terminate_child(&mut child, None);
+                let _ = fs::remove_file(&temporary_output);
+                return Err(Error::Invalid(
+                    "FFmpeg process did not expose a stderr pipe".to_owned(),
+                ));
+            }
+        };
+        let stderr_reader = match thread::Builder::new()
+            .name("ffmpeg-av1-stderr".to_owned())
+            .spawn(move || {
+                let mut bytes = Vec::new();
+                let mut chunk = [0; 8 * 1024];
+                loop {
+                    let count = stderr.read(&mut chunk)?;
+                    if count == 0 {
+                        break;
+                    }
+                    let retained = (MAX_CAPTURED_STDERR_BYTES - bytes.len()).min(count);
+                    bytes.extend_from_slice(&chunk[..retained]);
+                }
+                Ok(bytes)
+            }) {
+            Ok(reader) => reader,
+            Err(error) => {
+                drop(stdin);
+                terminate_child(&mut child, None);
+                let _ = fs::remove_file(&temporary_output);
+                return Err(Error::Io(error));
+            }
+        };
+        Ok(Self {
+            child: Some(child),
+            stdin: Some(stdin),
+            stderr_reader: Some(stderr_reader),
+            output: output.to_owned(),
+            temporary_output,
+            overwrite,
+            bytes: 0,
+            failed: false,
+        })
+    }
+
+    pub fn write_packet(&mut self, obu: &[u8]) -> Result<()> {
+        if self.failed {
+            return Err(Error::Invalid(
+                "AV1 muxer is in a terminal failed state".to_owned(),
+            ));
+        }
+        if obu.is_empty() {
+            return Err(Error::Invalid("AV1 packet cannot be empty".to_owned()));
+        }
+        let write_result = write_all_with_timeout(
+            self.stdin
+                .as_mut()
+                .ok_or_else(|| Error::Invalid("AV1 muxer is already finished".to_owned()))?,
+            obu,
+            DEFAULT_WRITE_TIMEOUT,
+        );
+        if let Err(error) = write_result {
+            drop(self.stdin.take());
+            if let Some(child) = self.child.take() {
+                defer_terminate_child(child, self.stderr_reader.take());
+            }
+            let _ = fs::remove_file(&self.temporary_output);
+            self.failed = true;
+            return Err(Error::Io(error));
+        }
+        self.bytes = self
+            .bytes
+            .checked_add(obu.len() as u64)
+            .ok_or(Error::ArithmeticOverflow)?;
+        Ok(())
+    }
+
+    pub fn finish(mut self, frames: u64) -> Result<VideoEncoderStats> {
+        if self.failed {
+            return Err(Error::Invalid(
+                "AV1 muxer is in a terminal failed state".to_owned(),
+            ));
+        }
+        if frames == 0 || self.bytes == 0 {
+            return Err(Error::Invalid("AV1 muxer received no frames".to_owned()));
+        }
+        drop(self.stdin.take());
+        let child = self
+            .child
+            .as_mut()
+            .expect("live AV1 muxer retains its FFmpeg process");
+        let status = match wait_child_with_timeout(child, DEFAULT_FINISH_TIMEOUT) {
+            Ok(Some(status)) => status,
+            Ok(None) => {
+                if let Some(child) = self.child.take() {
+                    defer_terminate_child(child, self.stderr_reader.take());
+                }
+                let _ = fs::remove_file(&self.temporary_output);
+                self.failed = true;
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timed out flushing the AV1 MP4 muxer",
+                )));
+            }
+            Err(error) => {
+                if let Some(child) = self.child.take() {
+                    defer_terminate_child(child, self.stderr_reader.take());
+                }
+                let _ = fs::remove_file(&self.temporary_output);
+                self.failed = true;
+                return Err(Error::Io(error));
+            }
+        };
+        drop(self.child.take());
+        let stderr = self
+            .stderr_reader
+            .take()
+            .ok_or_else(|| Error::Invalid("FFmpeg stderr reader is unavailable".to_owned()))?
+            .join()
+            .map_err(|_| Error::Invalid("FFmpeg stderr reader panicked".to_owned()))??;
+        if !status.success() {
+            let _ = fs::remove_file(&self.temporary_output);
+            let message = String::from_utf8_lossy(&stderr);
+            let message = message.trim();
+            return Err(Error::Invalid(if message.is_empty() {
+                format!("FFmpeg exited with status {status}")
+            } else {
+                format!("FFmpeg exited with status {status}: {message}")
+            }));
+        }
+        publish_output(&self.temporary_output, &self.output, self.overwrite)?;
+        Ok(VideoEncoderStats {
+            frames,
+            bytes: self.bytes,
+        })
+    }
+}
+
+impl Drop for FfmpegAv1Muxer {
     fn drop(&mut self) {
         drop(self.stdin.take());
         if let Some(child) = self.child.take() {
@@ -583,6 +818,30 @@ fn temporary_output_path(output: &Path) -> Result<std::path::PathBuf> {
     Ok(parent.join(name))
 }
 
+fn publish_output(temporary_output: &Path, output: &Path, overwrite: bool) -> Result<()> {
+    if overwrite {
+        fs::rename(temporary_output, output)?;
+        return Ok(());
+    }
+    // A same-directory hard link publishes the complete inode atomically and
+    // fails instead of clobbering a path that appeared after preflight.
+    fs::hard_link(temporary_output, output).map_err(|error| {
+        let _ = fs::remove_file(temporary_output);
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            Error::Invalid(format!(
+                "video output appeared while encoding: {}",
+                output.display()
+            ))
+        } else {
+            Error::Io(error)
+        }
+    })?;
+    // The complete output is already atomically published. A stale hidden
+    // link is cleanup debt, not an encoding failure.
+    let _ = fs::remove_file(temporary_output);
+    Ok(())
+}
+
 fn validate_config(config: VideoEncoderConfig) -> Result<()> {
     if config.width == 0 || config.height == 0 {
         return Err(Error::Invalid(
@@ -616,8 +875,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        FfmpegVideoEncoder, VideoCodec, VideoEncoderConfig, wait_child_with_timeout,
-        write_all_with_timeout,
+        FfmpegAv1Muxer, FfmpegVideoEncoder, VideoCodec, VideoEncoderConfig,
+        wait_child_with_timeout, write_all_with_timeout,
     };
     use crate::{Rational, rgba8_to_nv12_reference};
 
@@ -728,6 +987,43 @@ mod tests {
     }
 
     #[test]
+    fn streams_av1_packets_through_one_mux_process() {
+        let unique = TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "screeps-arena-av1-muxer-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let program = directory.join("fake-ffmpeg");
+        let output = directory.join("output.mp4");
+        fs::write(
+            &program,
+            "#!/bin/sh\nfor last do :; done\ncat > \"$last\"\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&program).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&program, permissions).unwrap();
+
+        let mut muxer = FfmpegAv1Muxer::spawn_with_program(
+            &program,
+            &output,
+            Rational::new(30, 1).unwrap(),
+            false,
+        )
+        .unwrap();
+        muxer.write_packet(&[1, 2, 3]).unwrap();
+        assert!(muxer.write_packet(&[]).is_err());
+        muxer.write_packet(&[4, 5]).unwrap();
+        let stats = muxer.finish(2).unwrap();
+        assert_eq!(stats.frames, 2);
+        assert_eq!(stats.bytes, 5);
+        assert_eq!(fs::read(&output).unwrap(), [1, 2, 3, 4, 5]);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn installed_ffmpeg_muxes_exact_nv12_frame_count() {
         let encoders = match Command::new("ffmpeg")
             .args(["-hide_banner", "-encoders"])
@@ -753,13 +1049,13 @@ mod tests {
             height: 16,
             frames_per_second: Rational::new(60, 1).unwrap(),
             codec: VideoCodec::H264Software,
-            quality: 18,
+            quality: 0,
             overwrite: false,
         };
         let mut encoder = FfmpegVideoEncoder::spawn(&output, real_config).unwrap();
-        let black = rgba8_to_nv12_reference(16, 16, &[0, 0, 0, 255].repeat(256)).unwrap();
+        let color = rgba8_to_nv12_reference(16, 16, &[32, 64, 96, 255].repeat(256)).unwrap();
         let white = rgba8_to_nv12_reference(16, 16, &[255, 255, 255, 255].repeat(256)).unwrap();
-        encoder.write_frame(&black).unwrap();
+        encoder.write_frame(&color).unwrap();
         encoder.write_frame(&white).unwrap();
         assert_eq!(encoder.finish().unwrap().frames, 2);
 
@@ -790,9 +1086,28 @@ mod tests {
         assert_eq!(stream["color_transfer"], "bt709");
         assert_eq!(stream["color_primaries"], "bt709");
 
+        let decoded = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-i",
+                output.to_str().unwrap(),
+                "-frames:v",
+                "1",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "nv12",
+                "pipe:1",
+            ])
+            .output()
+            .unwrap();
+        assert!(decoded.status.success());
+        assert_eq!(decoded.stdout, color);
+
         real_config.overwrite = true;
         let mut overwrite = FfmpegVideoEncoder::spawn(&output, real_config).unwrap();
-        overwrite.write_frame(&black).unwrap();
+        overwrite.write_frame(&color).unwrap();
         assert_eq!(overwrite.finish().unwrap().frames, 1);
         fs::remove_dir_all(directory).unwrap();
     }

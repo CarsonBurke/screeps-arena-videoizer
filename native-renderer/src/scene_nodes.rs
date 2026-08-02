@@ -18,6 +18,11 @@ pub struct NodeTransform {
 #[derive(Clone, Debug, PartialEq)]
 pub enum SceneNodeKind {
     Container,
+    CreepBody {
+        program: crate::VectorProgram,
+        mesh: crate::VectorMesh,
+        tough: Option<AtlasEntry>,
+    },
     Vector {
         program: crate::VectorProgram,
         mesh: crate::VectorMesh,
@@ -30,6 +35,7 @@ pub enum SceneNodeKind {
         atlas: AtlasEntry,
         natural_size: [f64; 2],
         anchor: [f64; 2],
+        pixel_snap: bool,
         tint: u32,
         blend_mode: SpriteBlendMode,
         blur: Option<f64>,
@@ -65,6 +71,7 @@ pub struct SceneNodeKey {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SceneNodeTemplates {
     pub nodes: Vec<SceneNodeTemplate>,
+    pub(crate) creep_actions: crate::creep_actions::CreepActionsTemplates,
     nodes_by_activation: BTreeMap<u32, usize>,
 }
 
@@ -117,7 +124,7 @@ pub struct SpriteDisplayEntry {
     pub layer_order: u32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum SceneDrawableKind {
     Sprite,
     Vector,
@@ -145,6 +152,7 @@ impl SceneFrameScratch {
 impl SceneNodeTemplates {
     pub fn vector_meshes(&self) -> impl Iterator<Item = &crate::VectorMesh> {
         self.nodes.iter().filter_map(|node| match &node.kind {
+            SceneNodeKind::CreepBody { mesh, .. } => Some(mesh),
             SceneNodeKind::Vector { mesh, .. } => Some(mesh),
             SceneNodeKind::Container | SceneNodeKind::Sprite { .. } => None,
         })
@@ -218,10 +226,12 @@ impl SceneNodeTemplates {
                 kind,
                 ProcessorKind::Circle
                     | ProcessorKind::Container
+                    | ProcessorKind::CreepBuildBody
                     | ProcessorKind::Draw
                     | ProcessorKind::ResourceCircle
                     | ProcessorKind::SiteProgress
                     | ProcessorKind::Sprite
+                    | ProcessorKind::Text
                     | ProcessorKind::UserBadge
             ) {
                 continue;
@@ -259,6 +269,28 @@ impl SceneNodeTemplates {
             };
             let node_kind = match kind {
                 ProcessorKind::Container => SceneNodeKind::Container,
+                ProcessorKind::CreepBuildBody => {
+                    let program = crate::VectorProgram::from_draw_payload(&ResolvedValue::Object(
+                        payload.clone(),
+                    ))?;
+                    let mesh = crate::tessellate_vector_program(&program)?;
+                    let tough = if payload.get("$nativeCreepBodyHasTough")
+                        == Some(&ResolvedValue::Bool(true))
+                    {
+                        Some(atlas.entries.get("tough").copied().ok_or_else(|| {
+                            Error::Invalid(
+                                "creepBuildBody references missing atlas texture tough".to_owned(),
+                            )
+                        })?)
+                    } else {
+                        None
+                    };
+                    SceneNodeKind::CreepBody {
+                        program,
+                        mesh,
+                        tough,
+                    }
+                }
                 ProcessorKind::Draw => {
                     let program = crate::VectorProgram::from_draw_payload(&ResolvedValue::Object(
                         payload.clone(),
@@ -284,8 +316,8 @@ impl SceneNodeTemplates {
                         blur: None,
                     }
                 }
-                ProcessorKind::Sprite | ProcessorKind::UserBadge
-                    if payload.contains_key("texture") =>
+                ProcessorKind::Sprite | ProcessorKind::Text | ProcessorKind::UserBadge
+                    if *kind == ProcessorKind::Sprite || payload.contains_key("texture") =>
                 {
                     let texture = effective_texture(payload, object_texture.as_ref())?;
                     let Some(texture) = texture else {
@@ -296,7 +328,13 @@ impl SceneNodeTemplates {
                             "sprite processor references missing atlas texture {texture}"
                         ))
                     })?;
-                    sprite_kind(payload, texture, entry, common.scale)?
+                    sprite_kind(
+                        payload,
+                        texture,
+                        entry,
+                        common.scale,
+                        *kind == ProcessorKind::Text,
+                    )?
                 }
                 ProcessorKind::Circle
                 | ProcessorKind::ResourceCircle
@@ -313,24 +351,32 @@ impl SceneNodeTemplates {
                         atlas: entry,
                         natural_size,
                         anchor: [0.5, 0.5],
+                        pixel_snap: false,
                         tint: color(payload.get("tint"), 0x00ff_ffff, "circle tint")?,
                         blend_mode: blend_mode(payload.get("blendMode"))?,
                         blur: optional_optional_number(payload.get("blur"), "circle blur")?,
                     }
                 }
-                _ => unreachable!("dedicated processors were filtered above"),
+                _ => {
+                    return Err(Error::Invalid(format!(
+                        "native scene-node compiler cannot lower {} processor",
+                        kind.as_str()
+                    )));
+                }
             };
             let scale = match &node_kind {
                 SceneNodeKind::Sprite { natural_size, .. } => {
                     dimension_scale(payload, *natural_size, common.scale)?
                 }
-                SceneNodeKind::Container | SceneNodeKind::Vector { .. } => common.scale,
+                SceneNodeKind::Container
+                | SceneNodeKind::CreepBody { .. }
+                | SceneNodeKind::Vector { .. } => common.scale,
             };
             let pivot = match &node_kind {
                 SceneNodeKind::Sprite { .. } => parsed_pivot(payload, scale)?,
-                SceneNodeKind::Container | SceneNodeKind::Vector { .. } => {
-                    parsed_pivot(common_payload, scale)?
-                }
+                SceneNodeKind::Container
+                | SceneNodeKind::CreepBody { .. }
+                | SceneNodeKind::Vector { .. } => parsed_pivot(common_payload, scale)?,
             };
             let transform = NodeTransform {
                 position: common.position,
@@ -360,6 +406,31 @@ impl SceneNodeTemplates {
                 kind: node_kind,
             });
         }
+        let first_synthetic_activation = scene
+            .activations
+            .iter()
+            .map(|activation| match activation {
+                ResolvedActivation::Object {
+                    activation_order, ..
+                }
+                | ResolvedActivation::Processor {
+                    activation_order, ..
+                }
+                | ResolvedActivation::Action {
+                    activation_order, ..
+                } => *activation_order,
+            })
+            .max()
+            .map_or(Ok(0), |maximum| {
+                maximum.checked_add(1).ok_or_else(|| {
+                    Error::Invalid(
+                        "native scene has no activation identity space for adapters".to_owned(),
+                    )
+                })
+            })?;
+        let (creep_actions, creep_action_nodes) =
+            crate::creep_actions::compile_templates(scene, atlas, first_synthetic_activation)?;
+        nodes.extend(creep_action_nodes);
         let nodes_by_activation = nodes
             .iter()
             .enumerate()
@@ -372,6 +443,7 @@ impl SceneNodeTemplates {
         }
         Ok(Self {
             nodes,
+            creep_actions,
             nodes_by_activation,
         })
     }
@@ -486,19 +558,38 @@ impl SceneNodeTemplates {
                     "display order references unknown scene activation {activation}"
                 )));
             };
-            let SceneNodeKind::Sprite {
-                atlas,
-                natural_size,
-                anchor,
-                tint: _,
-                blend_mode,
-                blur,
-                ..
-            } = &node.kind
-            else {
-                return Err(Error::Invalid(format!(
-                    "display order references non-sprite scene activation {activation}"
-                )));
+            let (atlas, natural_size, anchor, pixel_snap, blend_mode, blur) = match &node.kind {
+                SceneNodeKind::Sprite {
+                    atlas,
+                    natural_size,
+                    anchor,
+                    pixel_snap,
+                    blend_mode,
+                    blur,
+                    ..
+                } => (
+                    *atlas,
+                    *natural_size,
+                    *anchor,
+                    *pixel_snap,
+                    *blend_mode,
+                    *blur,
+                ),
+                SceneNodeKind::CreepBody {
+                    tough: Some(atlas), ..
+                } => (
+                    *atlas,
+                    [120.0, 120.0],
+                    [0.5, 0.5],
+                    false,
+                    SpriteBlendMode::Normal,
+                    None,
+                ),
+                _ => {
+                    return Err(Error::Invalid(format!(
+                        "display order references non-sprite scene activation {activation}"
+                    )));
+                }
             };
             let Some(prepared) = scratch.transforms.get(&activation).copied() else {
                 continue;
@@ -509,16 +600,21 @@ impl SceneNodeTemplates {
                 ))
             })?;
             let tint = target.tint;
-            let blur = effective_blur(Some(target), *blur);
+            let blur = effective_blur(Some(target), blur);
             scratch.instances.push(PreparedSpriteInstance {
                 activation_order: node.activation_order,
                 layer_order: entry.layer_order,
-                blend_mode: *blend_mode,
+                blend_mode,
                 instance: sprite_instance(SpriteInstanceParameters {
-                    transform: prepared.transform,
-                    natural_size: *natural_size,
-                    anchor: *anchor,
-                    atlas: *atlas,
+                    transform: maybe_snap_text_transform(
+                        pixel_snap,
+                        prepared.transform,
+                        natural_size,
+                        anchor,
+                    ),
+                    natural_size,
+                    anchor,
+                    atlas,
                     alpha: prepared.alpha,
                     tint,
                     visible: prepared.visible,
@@ -695,17 +791,37 @@ fn prepared_sprite(
     prepared: ActiveTransform,
     action_target: Option<&ActionTarget>,
 ) -> Option<PreparedSprite> {
-    let SceneNodeKind::Sprite {
-        atlas,
-        natural_size,
-        anchor,
-        tint,
-        blend_mode,
-        blur,
-        ..
-    } = &node.kind
-    else {
-        return None;
+    let (atlas, natural_size, anchor, pixel_snap, tint, blend_mode, blur) = match &node.kind {
+        SceneNodeKind::Sprite {
+            atlas,
+            natural_size,
+            anchor,
+            pixel_snap,
+            tint,
+            blend_mode,
+            blur,
+            ..
+        } => (
+            *atlas,
+            *natural_size,
+            *anchor,
+            *pixel_snap,
+            *tint,
+            *blend_mode,
+            *blur,
+        ),
+        SceneNodeKind::CreepBody {
+            tough: Some(atlas), ..
+        } => (
+            *atlas,
+            [120.0, 120.0],
+            [0.5, 0.5],
+            false,
+            0x00ff_ffff,
+            SpriteBlendMode::Normal,
+            None,
+        ),
+        _ => return None,
     };
     Some(PreparedSprite {
         entity_id: node.entity_id.clone(),
@@ -713,16 +829,31 @@ fn prepared_sprite(
         layer: node.layer.clone(),
         z_index: node.z_index,
         activation_order: node.activation_order,
-        transform: prepared.transform,
-        natural_size: *natural_size,
-        anchor: *anchor,
-        atlas: *atlas,
+        transform: maybe_snap_text_transform(pixel_snap, prepared.transform, natural_size, anchor),
+        natural_size,
+        anchor,
+        atlas,
         alpha: prepared.alpha,
-        tint: action_target.map_or(*tint, |target| target.tint),
+        tint: action_target.map_or(tint, |target| target.tint),
         visible: prepared.visible,
-        blend_mode: *blend_mode,
-        blur: effective_blur(action_target, *blur),
+        blend_mode,
+        blur: effective_blur(action_target, blur),
     })
+}
+
+fn maybe_snap_text_transform(
+    pixel_snap: bool,
+    mut transform: Affine2,
+    natural_size: [f64; 2],
+    anchor: [f64; 2],
+) -> Affine2 {
+    if !pixel_snap {
+        return transform;
+    }
+    let top_left = transform.point([-anchor[0] * natural_size[0], -anchor[1] * natural_size[1]]);
+    transform.tx += top_left[0].round() - top_left[0];
+    transform.ty += top_left[1].round() - top_left[1];
+    transform
 }
 
 fn prepared_vector<'a>(
@@ -730,15 +861,16 @@ fn prepared_vector<'a>(
     prepared: ActiveTransform,
     action_target: Option<&ActionTarget>,
 ) -> Option<PreparedVector<'a>> {
-    let SceneNodeKind::Vector {
-        mesh,
-        tint,
-        blend_mode,
-        blur,
-        ..
-    } = &node.kind
-    else {
-        return None;
+    let (mesh, tint, blend_mode, blur) = match &node.kind {
+        SceneNodeKind::Vector {
+            mesh,
+            tint,
+            blend_mode,
+            blur,
+            ..
+        } => (mesh, *tint, *blend_mode, *blur),
+        SceneNodeKind::CreepBody { mesh, .. } => (mesh, 0x00ff_ffff, SpriteBlendMode::Normal, None),
+        _ => return None,
     };
     Some(PreparedVector {
         entity_id: &node.entity_id,
@@ -750,10 +882,10 @@ fn prepared_vector<'a>(
         transform: prepared.transform,
         mesh,
         alpha: prepared.alpha,
-        tint: action_target.map_or(*tint, |target| target.tint),
+        tint: action_target.map_or(tint, |target| target.tint),
         visible: prepared.visible,
-        blend_mode: *blend_mode,
-        blur: effective_blur(action_target, *blur),
+        blend_mode,
+        blur: effective_blur(action_target, blur),
     })
 }
 
@@ -780,6 +912,7 @@ impl SceneNodeTemplate {
 
     pub fn initial_action_target(&self) -> ActionTarget {
         let (tint, filters) = match &self.kind {
+            SceneNodeKind::CreepBody { .. } => (0x00ff_ffff, Vec::new()),
             SceneNodeKind::Sprite { tint, blur, .. } => {
                 let filters = blur
                     .map(|blur| BTreeMap::from([("blur".to_owned(), blur)]))
@@ -953,6 +1086,7 @@ fn sprite_kind(
     texture: &str,
     entry: AtlasEntry,
     initial_scale: [f64; 2],
+    pixel_snap: bool,
 ) -> Result<SceneNodeKind> {
     let natural_size = [
         f64::from(entry.logical_width),
@@ -968,6 +1102,7 @@ fn sprite_kind(
         atlas: entry,
         natural_size,
         anchor,
+        pixel_snap,
         tint: color(payload.get("tint"), 0x00ff_ffff, "sprite tint")?,
         blend_mode: blend_mode(payload.get("blendMode"))?,
         blur: optional_optional_number(payload.get("blur"), "sprite blur")?,
@@ -1118,7 +1253,7 @@ mod tests {
     };
 
     #[test]
-    fn lowers_sprite_dimensions_anchor_pivot_color_and_blend_like_pixi() {
+    fn lowers_sprite_object_texture_dimensions_anchor_pivot_color_and_blend_like_pixi() {
         let entry = AtlasEntry {
             page: 0,
             x: 0,
@@ -1145,10 +1280,6 @@ mod tests {
             (
                 "id".to_owned(),
                 ResolvedValue::String("__root__".to_owned()),
-            ),
-            (
-                "texture".to_owned(),
-                ResolvedValue::String("unit".to_owned()),
             ),
             ("width".to_owned(), ResolvedValue::Number(200.0)),
             (
@@ -1189,7 +1320,7 @@ mod tests {
                     start_tick: 1,
                     end_tick: 5,
                     payload,
-                    object_texture: None,
+                    object_texture: Some(ResolvedValue::String("unit".to_owned())),
                     node_id: Some("__root__".to_owned()),
                     target_is_root: false,
                     touches_node: true,

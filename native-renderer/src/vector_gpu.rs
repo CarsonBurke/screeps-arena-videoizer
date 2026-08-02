@@ -168,6 +168,16 @@ fn fragment_copy(input: VertexOutput) -> @location(0) vec4<f32> {
 }
 
 @fragment
+fn fragment_clear_transparent() -> @location(0) vec4<f32> {
+    return vec4<f32>(0.0);
+}
+
+@fragment
+fn fragment_clear_multiply() -> @location(0) vec4<f32> {
+    return vec4<f32>(1.0, 1.0, 1.0, 0.0);
+}
+
+@fragment
 fn fragment_downsample(input: VertexOutput) -> @location(0) vec4<f32> {
     let base = vec2<i32>(input.position.xy) * 2;
     let layer = i32(input.layer);
@@ -483,6 +493,7 @@ pub struct VectorPipeline {
     filter_pong_view: wgpu::TextureView,
     geometry_buffer: wgpu::Buffer,
     geometry_ranges: BTreeMap<VectorGeometryId, Range<u32>>,
+    geometry_bounds: BTreeMap<VectorGeometryId, Option<[f32; 4]>>,
     slots: Vec<VectorBatchSlot>,
     output_size: [u32; 2],
     views_per_batch: NonZeroU32,
@@ -508,6 +519,8 @@ struct VectorFilterConfig {
 
 struct VectorFilterPipeline {
     bind_group_layout: wgpu::BindGroupLayout,
+    clear_transparent: wgpu::RenderPipeline,
+    clear_multiply: wgpu::RenderPipeline,
     downsample: wgpu::RenderPipeline,
     blur: wgpu::RenderPipeline,
     blur_final: wgpu::RenderPipeline,
@@ -536,6 +549,29 @@ struct ResidentVectorDrawRun {
     vertices: Range<u32>,
     slot: u32,
     has_blur_filter: bool,
+    output_scissor: Option<ScissorRect>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ScissorRect {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+impl ScissorRect {
+    fn supersampled(self) -> Result<Self> {
+        Ok(Self {
+            x: self.x.checked_mul(2).ok_or(Error::ArithmeticOverflow)?,
+            y: self.y.checked_mul(2).ok_or(Error::ArithmeticOverflow)?,
+            width: self.width.checked_mul(2).ok_or(Error::ArithmeticOverflow)?,
+            height: self
+                .height
+                .checked_mul(2)
+                .ok_or(Error::ArithmeticOverflow)?,
+        })
+    }
 }
 
 pub(crate) struct EncodedTemporalVectorBatch {
@@ -668,6 +704,7 @@ impl VectorPipeline {
             .and_then(|bytes| bytes.checked_mul(u64::from(in_flight_batches.get())))
             .ok_or(Error::ArithmeticOverflow)?;
         let (geometry_buffer, geometry_ranges) = build_geometry_bank(device, meshes, ring_bytes)?;
+        let geometry_bounds = build_geometry_bounds(meshes)?;
         let bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("temporal vector bindings"),
@@ -778,6 +815,7 @@ impl VectorPipeline {
             filter_pong_view: filter_pong.view.clone(),
             geometry_buffer,
             geometry_ranges,
+            geometry_bounds,
             slots,
             output_size,
             views_per_batch,
@@ -827,6 +865,19 @@ impl VectorPipeline {
                     vertices,
                     slot: run.slot,
                     has_blur_filter: run.has_blur_filter,
+                    output_scissor: self
+                        .geometry_bounds
+                        .get(&run.geometry_id)
+                        .ok_or_else(|| {
+                            Error::Invalid(format!(
+                                "vector activation {} lacks resident geometry bounds",
+                                run.activation_order
+                            ))
+                        })?
+                        .as_ref()
+                        .map(|bounds| output_scissor(bounds, batch, run.slot, self.output_size))
+                        .transpose()?
+                        .flatten(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -907,67 +958,126 @@ impl VectorPipeline {
             }
             return Ok(());
         }
-        let slot = self.slots.get(batch.slot_index).ok_or_else(|| {
-            Error::Invalid(format!(
-                "encoded vector batch references invalid ring slot {}",
-                batch.slot_index
-            ))
-        })?;
+        let slot = self.vector_slot(batch)?;
         let mut scene_load = load;
         for run in runs {
-            {
-                let scratch_clear =
-                    if !run.has_blur_filter && run.blend_mode == SpriteBlendMode::Multiply {
-                        wgpu::Color {
-                            r: 1.0,
-                            g: 1.0,
-                            b: 1.0,
-                            a: 0.0,
-                        }
-                    } else {
-                        wgpu::Color::TRANSPARENT
-                    };
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("temporal vector 2x supersample node"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &self.supersample_view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(scratch_clear),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    ..Default::default()
-                });
-                pass.set_pipeline(self.raster_pipelines.for_blend(run.blend_mode));
-                pass.set_bind_group(0, &slot.bind_group, &[]);
-                pass.set_vertex_buffer(0, self.geometry_buffer.slice(..));
-                pass.draw(run.vertices.clone(), run.slot..run.slot + 1);
-            }
-            encode_vector_filter_pass(
-                encoder,
-                &self.filter_pipeline.downsample,
-                &slot.filter.supersample_bind_group,
-                &self.filter_ping_view,
-                0,
-                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-            );
+            let Some(output_scissor) = run.output_scissor else {
+                continue;
+            };
+            self.encode_run_to_ping(encoder, slot, run)?;
             if run.has_blur_filter {
                 self.encode_blurred_run(encoder, slot, target, run, scene_load)?;
             } else {
-                encode_vector_filter_pass(
-                    encoder,
-                    self.filter_pipeline.composite.for_blend(run.blend_mode),
-                    &slot.filter.ping_bind_group,
-                    target,
-                    0,
-                    scene_load,
-                );
+                let mut pass = begin_vector_target_pass(encoder, target, scene_load);
+                self.draw_unfiltered_run(&mut pass, slot, run, output_scissor);
             }
             scene_load = wgpu::LoadOp::Load;
         }
         Ok(())
+    }
+
+    fn vector_slot<'a>(
+        &'a self,
+        batch: &EncodedTemporalVectorBatch,
+    ) -> Result<&'a VectorBatchSlot> {
+        self.slots.get(batch.slot_index).ok_or_else(|| {
+            Error::Invalid(format!(
+                "encoded vector batch references invalid ring slot {}",
+                batch.slot_index
+            ))
+        })
+    }
+
+    fn encode_run_to_ping(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        slot: &VectorBatchSlot,
+        run: &ResidentVectorDrawRun,
+    ) -> Result<()> {
+        let output_scissor = run
+            .output_scissor
+            .expect("material vector runs retain an output scissor");
+        let scratch_clear = if !run.has_blur_filter && run.blend_mode == SpriteBlendMode::Multiply {
+            wgpu::Color {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 0.0,
+            }
+        } else {
+            wgpu::Color::TRANSPARENT
+        };
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("temporal vector 2x supersample node"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.supersample_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: if run.has_blur_filter {
+                            wgpu::LoadOp::Clear(scratch_clear)
+                        } else {
+                            wgpu::LoadOp::Load
+                        },
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            if !run.has_blur_filter {
+                let supersample_scissor = output_scissor.supersampled()?;
+                pass.set_scissor_rect(
+                    supersample_scissor.x,
+                    supersample_scissor.y,
+                    supersample_scissor.width,
+                    supersample_scissor.height,
+                );
+                pass.set_pipeline(if run.blend_mode == SpriteBlendMode::Multiply {
+                    &self.filter_pipeline.clear_multiply
+                } else {
+                    &self.filter_pipeline.clear_transparent
+                });
+                // The clear entry point does not sample binding 0. Bind a
+                // different scratch view so wgpu does not conservatively mark
+                // the supersample attachment as both input and output.
+                pass.set_bind_group(0, &slot.filter.ping_bind_group, &[0]);
+                pass.draw(0..3, 0..1);
+            }
+            pass.set_pipeline(self.raster_pipelines.for_blend(run.blend_mode));
+            pass.set_bind_group(0, &slot.bind_group, &[]);
+            pass.set_vertex_buffer(0, self.geometry_buffer.slice(..));
+            pass.draw(run.vertices.clone(), run.slot..run.slot + 1);
+        }
+        encode_vector_filter_pass(
+            encoder,
+            &self.filter_pipeline.downsample,
+            &slot.filter.supersample_bind_group,
+            &self.filter_ping_view,
+            0,
+            if run.has_blur_filter {
+                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
+            } else {
+                // The full-screen resolve overwrites every pixel inside the
+                // scissor, and only that region is composited.
+                wgpu::LoadOp::Load
+            },
+            (!run.has_blur_filter).then_some(output_scissor),
+        );
+        Ok(())
+    }
+
+    fn draw_unfiltered_run(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        slot: &VectorBatchSlot,
+        run: &ResidentVectorDrawRun,
+        scissor: ScissorRect,
+    ) {
+        pass.set_scissor_rect(scissor.x, scissor.y, scissor.width, scissor.height);
+        pass.set_pipeline(self.filter_pipeline.composite.for_blend(run.blend_mode));
+        pass.set_bind_group(0, &slot.filter.ping_bind_group, &[0]);
+        pass.draw(0..3, 0..1);
     }
 
     fn encode_blurred_run(
@@ -1034,6 +1144,7 @@ impl VectorPipeline {
                 destination,
                 offset,
                 load,
+                None,
             );
         }
         encode_vector_filter_pass(
@@ -1043,6 +1154,7 @@ impl VectorPipeline {
             target,
             final_offset,
             load,
+            None,
         );
         Ok(())
     }
@@ -1220,6 +1332,126 @@ fn build_geometry_bank(
     Ok((buffer, ranges))
 }
 
+fn build_geometry_bounds(
+    meshes: &[&VectorMesh],
+) -> Result<BTreeMap<VectorGeometryId, Option<[f32; 4]>>> {
+    let mut bounds = BTreeMap::new();
+    for mesh in meshes {
+        let mesh_bounds = mesh.vertices().first().map(|first| {
+            let mut mesh_bounds = [
+                first.position[0],
+                first.position[1],
+                first.position[0],
+                first.position[1],
+            ];
+            for vertex in &mesh.vertices()[1..] {
+                mesh_bounds[0] = mesh_bounds[0].min(vertex.position[0]);
+                mesh_bounds[1] = mesh_bounds[1].min(vertex.position[1]);
+                mesh_bounds[2] = mesh_bounds[2].max(vertex.position[0]);
+                mesh_bounds[3] = mesh_bounds[3].max(vertex.position[1]);
+            }
+            mesh_bounds
+        });
+        if let Some(existing) = bounds.insert(mesh.geometry_id(), mesh_bounds)
+            && existing != mesh_bounds
+        {
+            return Err(Error::Invalid(
+                "distinct vector meshes collide on one geometry identity".to_owned(),
+            ));
+        }
+    }
+    Ok(bounds)
+}
+
+fn output_scissor(
+    geometry_bounds: &[f32; 4],
+    batch: &TemporalVectorBatch,
+    slot: u32,
+    output_size: [u32; 2],
+) -> Result<Option<ScissorRect>> {
+    let slot = usize::try_from(slot).map_err(|_| Error::ArithmeticOverflow)?;
+    let instances_per_view =
+        usize::try_from(batch.instances_per_view).map_err(|_| Error::ArithmeticOverflow)?;
+    let mut output_bounds: Option<[f32; 4]> = None;
+    for view in 0..batch.active_views.get() as usize {
+        let index = view
+            .checked_mul(instances_per_view)
+            .and_then(|index| index.checked_add(slot))
+            .ok_or(Error::ArithmeticOverflow)?;
+        let instance = batch.instances.get(index).ok_or_else(|| {
+            Error::Invalid("vector scissor references an absent instance".to_owned())
+        })?;
+        if instance.visible == 0 {
+            continue;
+        }
+        let [min_x, min_y, max_x, max_y] = *geometry_bounds;
+        let mut view_bounds: Option<[f32; 4]> = None;
+        for [x, y] in [
+            [min_x, min_y],
+            [max_x, min_y],
+            [min_x, max_y],
+            [max_x, max_y],
+        ] {
+            let transformed_x = instance.transform_x[0].mul_add(x, instance.transform_x[1] * y)
+                + instance.transform_x[2];
+            let transformed_y = instance.transform_y[0].mul_add(x, instance.transform_y[1] * y)
+                + instance.transform_y[2];
+            match &mut view_bounds {
+                Some(bounds) => {
+                    bounds[0] = bounds[0].min(transformed_x);
+                    bounds[1] = bounds[1].min(transformed_y);
+                    bounds[2] = bounds[2].max(transformed_x);
+                    bounds[3] = bounds[3].max(transformed_y);
+                }
+                None => {
+                    view_bounds =
+                        Some([transformed_x, transformed_y, transformed_x, transformed_y]);
+                }
+            }
+        }
+        let mut view_bounds = view_bounds.expect("geometry bounds have four corners");
+        if instance.has_blur_filter != 0 {
+            // Four quality passes can move a sample by half the configured
+            // strength each, for a total reach of twice the strength on each
+            // axis. Include bilinear support so an offscreen filtered vector
+            // is skipped only when its blur cannot affect the target.
+            let reach = instance.blur.abs().mul_add(2.0, 2.0);
+            view_bounds[0] -= reach;
+            view_bounds[1] -= reach;
+            view_bounds[2] += reach;
+            view_bounds[3] += reach;
+        }
+        match &mut output_bounds {
+            Some(bounds) => {
+                bounds[0] = bounds[0].min(view_bounds[0]);
+                bounds[1] = bounds[1].min(view_bounds[1]);
+                bounds[2] = bounds[2].max(view_bounds[2]);
+                bounds[3] = bounds[3].max(view_bounds[3]);
+            }
+            None => output_bounds = Some(view_bounds),
+        }
+    }
+    let Some([min_x, min_y, max_x, max_y]) = output_bounds else {
+        return Ok(None);
+    };
+    // The resolve samples a 2x raster at four subpixel centers. Expand one
+    // output pixel so edge samples and floating-point rasterization rules can
+    // never be clipped by the optimization.
+    let min_x = (min_x.floor() as i64 - 1).clamp(0, i64::from(output_size[0]));
+    let min_y = (min_y.floor() as i64 - 1).clamp(0, i64::from(output_size[1]));
+    let max_x = (max_x.ceil() as i64 + 1).clamp(0, i64::from(output_size[0]));
+    let max_y = (max_y.ceil() as i64 + 1).clamp(0, i64::from(output_size[1]));
+    if max_x <= min_x || max_y <= min_y {
+        return Ok(None);
+    }
+    Ok(Some(ScissorRect {
+        x: u32::try_from(min_x).map_err(|_| Error::ArithmeticOverflow)?,
+        y: u32::try_from(min_y).map_err(|_| Error::ArithmeticOverflow)?,
+        width: u32::try_from(max_x - min_x).map_err(|_| Error::ArithmeticOverflow)?,
+        height: u32::try_from(max_y - min_y).map_err(|_| Error::ArithmeticOverflow)?,
+    }))
+}
+
 impl VectorFilterPipeline {
     fn create(
         device: &wgpu::Device,
@@ -1286,6 +1518,24 @@ impl VectorFilterPipeline {
             label: Some("temporal vector filter shader"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(VECTOR_FILTER_SHADER)),
         });
+        let clear_transparent = create_filter_render_pipeline(
+            device,
+            &layout,
+            &shader,
+            views_per_batch,
+            "temporal vector partial transparent clear",
+            "fragment_clear_transparent",
+            None,
+        );
+        let clear_multiply = create_filter_render_pipeline(
+            device,
+            &layout,
+            &shader,
+            views_per_batch,
+            "temporal vector partial multiply clear",
+            "fragment_clear_multiply",
+            None,
+        );
         let downsample = create_filter_render_pipeline(
             device,
             &layout,
@@ -1323,6 +1573,8 @@ impl VectorFilterPipeline {
         );
         Ok(Self {
             bind_group_layout,
+            clear_transparent,
+            clear_multiply,
             downsample,
             blur,
             blur_final,
@@ -1578,6 +1830,7 @@ fn encode_vector_filter_pass(
     target: &wgpu::TextureView,
     dynamic_offset: u32,
     load: wgpu::LoadOp<wgpu::Color>,
+    scissor: Option<ScissorRect>,
 ) {
     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("temporal vector filter pass"),
@@ -1594,7 +1847,30 @@ fn encode_vector_filter_pass(
     });
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, bind_group, &[dynamic_offset]);
+    if let Some(scissor) = scissor {
+        pass.set_scissor_rect(scissor.x, scissor.y, scissor.width, scissor.height);
+    }
     pass.draw(0..3, 0..1);
+}
+
+fn begin_vector_target_pass<'a>(
+    encoder: &'a mut wgpu::CommandEncoder,
+    target: &'a wgpu::TextureView,
+    load: wgpu::LoadOp<wgpu::Color>,
+) -> wgpu::RenderPass<'a> {
+    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("temporal vector scene composite"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: target,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load,
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        ..Default::default()
+    })
 }
 
 fn validate_vector_color_budget(
@@ -1777,6 +2053,103 @@ mod tests {
         let slots = NonZeroU32::new(3).unwrap();
         super::validate_vector_color_budget([1920, 1080], views, slots).unwrap();
         assert!(super::validate_vector_color_budget([3840, 2160], views, slots).is_err());
+    }
+
+    #[test]
+    fn output_scissor_bounds_transformed_visible_geometry_conservatively() {
+        let mesh = tessellate_vector_program(&VectorProgram {
+            commands: vec![
+                VectorCommand::BeginFill(VectorFillStyle {
+                    color: 0xff_ff_ff,
+                    alpha: 1.0,
+                }),
+                VectorCommand::Rect {
+                    origin: [0.0, 0.0],
+                    size: [10.0, 10.0],
+                },
+            ],
+        })
+        .unwrap();
+        let vector = PreparedVector {
+            entity_id: "bounded",
+            node_id: "bounded",
+            layer: None,
+            layer_order: 0,
+            z_index: 0.0,
+            activation_order: 1,
+            transform: Affine2 {
+                a: 2.0,
+                b: 0.0,
+                c: 0.0,
+                d: 2.0,
+                tx: 10.25,
+                ty: 20.75,
+            },
+            mesh: &mesh,
+            alpha: 1.0,
+            tint: 0xff_ff_ff,
+            visible: true,
+            blend_mode: SpriteBlendMode::Normal,
+            blur: None,
+        };
+        let batch = TemporalVectorBatch::pack(
+            NonZeroU32::new(2).unwrap(),
+            &[std::slice::from_ref(&vector)],
+        )
+        .unwrap();
+        assert_eq!(
+            super::output_scissor(&[0.0, 0.0, 10.0, 10.0], &batch, 0, [100, 100]).unwrap(),
+            Some(super::ScissorRect {
+                x: 9,
+                y: 19,
+                width: 23,
+                height: 23,
+            })
+        );
+
+        let blurred_offscreen = PreparedVector {
+            transform: Affine2 {
+                a: 1.0,
+                b: 0.0,
+                c: 0.0,
+                d: 1.0,
+                tx: -15.0,
+                ty: 10.0,
+            },
+            blur: Some(4.0),
+            ..vector.clone()
+        };
+        let batch = TemporalVectorBatch::pack(
+            NonZeroU32::new(2).unwrap(),
+            &[std::slice::from_ref(&blurred_offscreen)],
+        )
+        .unwrap();
+        assert!(
+            super::output_scissor(&[0.0, 0.0, 10.0, 10.0], &batch, 0, [100, 100])
+                .unwrap()
+                .is_some()
+        );
+
+        let invisible = PreparedVector {
+            visible: false,
+            ..vector
+        };
+        let batch = TemporalVectorBatch::pack(
+            NonZeroU32::new(2).unwrap(),
+            &[std::slice::from_ref(&invisible)],
+        )
+        .unwrap();
+        assert_eq!(
+            super::output_scissor(&[0.0, 0.0, 10.0, 10.0], &batch, 0, [100, 100]).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn empty_geometry_has_an_explicit_non_drawing_bound() {
+        let mesh = tessellate_vector_program(&VectorProgram::default()).unwrap();
+        let bounds = super::build_geometry_bounds(&[&mesh]).unwrap();
+        assert_eq!(bounds.get(&mesh.geometry_id()), Some(&None));
     }
 
     #[test]

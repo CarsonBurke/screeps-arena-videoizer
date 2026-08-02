@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::{ActionRuntime, ActionTarget, Error, ResolvedActionNode, Result, SceneNodeKey};
 
@@ -20,6 +20,8 @@ struct ActiveAction {
 pub struct ActionManagerRuntime {
     targets: HashMap<u32, ActionTarget>,
     parent_activations: HashMap<u32, Option<u32>>,
+    display_insertion_orders: HashMap<u32, u64>,
+    next_display_insertion_order: u64,
     temporary_target_roots: HashMap<u32, u32>,
     addressable_targets: BTreeMap<SceneNodeKey, u32>,
     visible_targets: BTreeMap<SceneNodeKey, u32>,
@@ -27,6 +29,9 @@ pub struct ActionManagerRuntime {
     pinned_targets: BTreeSet<u32>,
     handles: Vec<ActiveAction>,
     groups: BTreeSet<u64>,
+    handle_groups: HashSet<u64>,
+    defer_target_collection: bool,
+    target_collection_pending: bool,
 }
 
 impl ActionManagerRuntime {
@@ -56,9 +61,12 @@ impl ActionManagerRuntime {
                 "action target activation {activation_id} references an unavailable parent"
             )));
         }
+        let insertion_order = self.take_display_insertion_order()?;
         self.targets.insert(activation_id, target);
         self.parent_activations
             .insert(activation_id, parent_activation);
+        self.display_insertion_orders
+            .insert(activation_id, insertion_order);
         if let Some(replaced) = self.addressable_targets.insert(key.clone(), activation_id) {
             self.visible_activations.remove(&replaced);
         }
@@ -98,9 +106,12 @@ impl ActionManagerRuntime {
                 "temporary action target activation {activation_id} references missing root {root_activation}"
             )));
         }
+        let insertion_order = self.take_display_insertion_order()?;
         self.targets.insert(activation_id, target);
         self.parent_activations
             .insert(activation_id, Some(parent_activation));
+        self.display_insertion_orders
+            .insert(activation_id, insertion_order);
         self.temporary_target_roots
             .insert(activation_id, root_activation);
         self.visible_activations.insert(activation_id);
@@ -134,6 +145,16 @@ impl ActionManagerRuntime {
 
     pub fn parent_activation(&self, activation_id: u32) -> Option<Option<u32>> {
         self.parent_activations.get(&activation_id).copied()
+    }
+
+    /// Stable Pixi display insertion order, independent of ReplayIR identity.
+    ///
+    /// Native adapters allocate collision-free activation IDs ahead of time,
+    /// but their display objects are still appended only when the corresponding
+    /// processor runs. Keeping these concepts separate prevents a large
+    /// synthetic ID from moving an old child behind a later ordinary child.
+    pub fn display_insertion_order(&self, activation_id: u32) -> Option<u64> {
+        self.display_insertion_orders.get(&activation_id).copied()
     }
 
     pub fn visible_activation(&self, key: &SceneNodeKey) -> Option<u32> {
@@ -262,6 +283,9 @@ impl ActionManagerRuntime {
             });
         }
         self.groups.insert(group_id);
+        if !actions.is_empty() {
+            self.handle_groups.insert(group_id);
+        }
         Ok(())
     }
 
@@ -272,6 +296,10 @@ impl ActionManagerRuntime {
                 "action group {group_id} does not exist"
             )));
         }
+        if !self.handle_groups.contains(&group_id) {
+            return Ok(());
+        }
+        let handle_count_before = self.handles.len();
         for handle in &mut self.handles {
             if handle.group_id != group_id {
                 continue;
@@ -282,8 +310,11 @@ impl ActionManagerRuntime {
                 .expect("target activations outlive their action handles");
             handle.runtime.finish(target)?;
         }
+        self.handle_groups.remove(&group_id);
         self.handles.retain(|handle| handle.group_id != group_id);
-        self.collect_detached_targets();
+        if self.handles.len() != handle_count_before {
+            self.collect_detached_targets();
+        }
         Ok(())
     }
 
@@ -293,8 +324,14 @@ impl ActionManagerRuntime {
                 "action group {group_id} does not exist"
             )));
         }
+        if !self.handle_groups.remove(&group_id) {
+            return Ok(());
+        }
+        let handle_count_before = self.handles.len();
         self.handles.retain(|handle| handle.group_id != group_id);
-        self.collect_detached_targets();
+        if self.handles.len() != handle_count_before {
+            self.collect_detached_targets();
+        }
         Ok(())
     }
 
@@ -315,9 +352,13 @@ impl ActionManagerRuntime {
     /// values. Processor node destruction deliberately does not call this:
     /// generic helper actions remain attached to the detached old Pixi object.
     pub fn cancel_for_target(&mut self, target_activation: u32) {
+        let handle_count_before = self.handles.len();
         self.handles
             .retain(|handle| handle.target_activation != target_activation);
-        self.collect_detached_targets();
+        if self.handles.len() != handle_count_before {
+            self.rebuild_handle_groups();
+            self.collect_detached_targets();
+        }
     }
 
     /// Update a stable snapshot of all active handles in insertion order, then
@@ -348,6 +389,7 @@ impl ActionManagerRuntime {
         // destroy, pin, and replace paths already call collect_detached_targets.
         // Avoid rebuilding the retained set on every substep of a long timeline.
         if self.handles.len() != handle_count_before {
+            self.rebuild_handle_groups();
             self.collect_detached_targets();
         }
         if let Some(error) = update_error {
@@ -367,7 +409,35 @@ impl ActionManagerRuntime {
         self.handles.len()
     }
 
+    pub(crate) fn begin_lifecycle_batch(&mut self) {
+        assert!(
+            !self.defer_target_collection,
+            "action-manager lifecycle batches cannot be nested"
+        );
+        self.defer_target_collection = true;
+    }
+
+    pub(crate) fn finish_lifecycle_batch(&mut self) {
+        assert!(
+            self.defer_target_collection,
+            "action-manager lifecycle batch was not started"
+        );
+        self.defer_target_collection = false;
+        if self.target_collection_pending {
+            self.target_collection_pending = false;
+            self.collect_detached_targets_now();
+        }
+    }
+
     fn collect_detached_targets(&mut self) {
+        if self.defer_target_collection {
+            self.target_collection_pending = true;
+            return;
+        }
+        self.collect_detached_targets_now();
+    }
+
+    fn collect_detached_targets_now(&mut self) {
         let retained = self
             .addressable_targets
             .values()
@@ -381,8 +451,25 @@ impl ActionManagerRuntime {
             .retain(|activation, _| retained.contains(activation));
         self.parent_activations
             .retain(|activation, _| retained.contains(activation));
+        self.display_insertion_orders
+            .retain(|activation, _| retained.contains(activation));
         self.temporary_target_roots
             .retain(|activation, _| retained.contains(activation));
+    }
+
+    fn rebuild_handle_groups(&mut self) {
+        self.handle_groups.clear();
+        self.handle_groups
+            .extend(self.handles.iter().map(|handle| handle.group_id));
+    }
+
+    fn take_display_insertion_order(&mut self) -> Result<u64> {
+        let order = self.next_display_insertion_order;
+        self.next_display_insertion_order = self
+            .next_display_insertion_order
+            .checked_add(1)
+            .ok_or(Error::ArithmeticOverflow)?;
+        Ok(order)
     }
 }
 
@@ -423,6 +510,20 @@ mod tests {
             node_id: "__root__".to_owned(),
             is_root: true,
         }
+    }
+
+    #[test]
+    fn display_insertion_order_is_independent_of_activation_identity() {
+        let mut manager = ActionManagerRuntime::default();
+        manager
+            .create_target(10_000, root_key(), ActionTarget::default())
+            .unwrap();
+        manager
+            .create_target(1, key("later"), ActionTarget::default())
+            .unwrap();
+
+        assert_eq!(manager.display_insertion_order(10_000), Some(0));
+        assert_eq!(manager.display_insertion_order(1), Some(1));
     }
 
     #[test]
@@ -475,6 +576,22 @@ mod tests {
         // The official processor scope can still later finish an array whose
         // handles have already left ActionManager; that is a no-op.
         manager.finish_group(10).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_batch_defers_detached_target_collection_until_tick_end() {
+        let mut manager = ActionManagerRuntime::default();
+        manager
+            .create_target(1, key("body"), ActionTarget::default())
+            .unwrap();
+        manager.begin_lifecycle_batch();
+        manager
+            .create_target(2, key("body"), ActionTarget::default())
+            .unwrap();
+        assert!(manager.target(1).is_some());
+        manager.finish_lifecycle_batch();
+        assert!(manager.target(1).is_none());
+        assert!(manager.target(2).is_some());
     }
 
     #[test]

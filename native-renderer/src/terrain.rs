@@ -801,7 +801,7 @@ fn parse_hex_color(value: &str) -> Option<u32> {
 }
 
 fn latest_truthy_tick(track: &Track, tick: u32) -> Option<u32> {
-    let Track(bounds, values, absent, undefined) = track;
+    let Track(bounds, values, absent, undefined, _) = track;
     let mut latest = None;
     for (index, pair) in bounds.chunks_exact(2).enumerate() {
         let start = pair[0];
@@ -1028,15 +1028,15 @@ mod tests {
         replay.insert(
             "globalState".to_owned(),
             json!({
-                "users": [[0, 2], [{"owner": {"color": "#ff00ff"}}], [], []]
+                "users": [[0, 2], [{"owner": {"color": "#ff00ff"}}], [], [], []]
             }),
         );
         replay["entities"][0]["properties"] = json!({
-            "type": [[0, 1, 1, 2], ["constructedWall", "rampart"], [], []],
-            "x": [[0, 2], [2], [], []],
-            "y": [[0, 2], [2], [], []],
-            "user": [[0, 2], ["owner"], [], []],
-            "isPublic": [[0, 2], [false], [], []]
+            "type": [[0, 1, 1, 2], ["constructedWall", "rampart"], [], [], []],
+            "x": [[0, 2], [2], [], [], []],
+            "y": [[0, 2], [2], [], [], []],
+            "user": [[0, 2], ["owner"], [], [], []],
+            "isPublic": [[0, 2], [false], [], [], []]
         });
         artifact["replay"] = signed(Value::Object(replay.clone()));
         let artifact = ReplayArtifact::from_slice(&serde_json::to_vec(&artifact).unwrap()).unwrap();
@@ -1092,16 +1092,17 @@ mod tests {
                         {"owner": {"color": "#445566"}}
                     ],
                     [],
+                    [],
                     []
                 ]
             }),
         );
         replay["entities"][0]["properties"] = json!({
-            "type": [[0, 2], ["rampart"], [], []],
-            "x": [[0, 2], [2], [], []],
-            "y": [[0, 2], [2], [], []],
-            "user": [[0, 2], ["owner"], [], []],
-            "isPublic": [[0, 2], [false], [], []]
+            "type": [[0, 2], ["rampart"], [], [], []],
+            "x": [[0, 2], [2], [], [], []],
+            "y": [[0, 2], [2], [], [], []],
+            "user": [[0, 2], ["owner"], [], [], []],
+            "isPublic": [[0, 2], [false], [], [], []]
         });
         artifact["replay"] = signed(Value::Object(replay.clone()));
         let artifact = ReplayArtifact::from_slice(&serde_json::to_vec(&artifact).unwrap()).unwrap();
@@ -1146,6 +1147,7 @@ mod tests {
                 "gameData": [
                     [0, 1, 1, 2],
                     [{"swampTexture": "animated"}, {"swampTexture": "disabled"}],
+                    [],
                     [],
                     []
                 ]
@@ -1196,14 +1198,15 @@ mod tests {
                     [0, 1, 1, 2],
                     [{"swampTexture": "animated"}, {"swampTexture": "disabled"}],
                     [],
+                    [],
                     []
                 ]
             }),
         );
         replay["entities"][0]["properties"] = json!({
-            "type": [[0, 2], ["swamp"], [], []],
-            "x": [[0, 1, 1, 2], [2, 3], [], []],
-            "y": [[0, 2], [2], [], []]
+            "type": [[0, 2], ["swamp"], [], [], []],
+            "x": [[0, 1, 1, 2], [2, 3], [], [], []],
+            "y": [[0, 2], [2], [], [], []]
         });
         artifact["replay"] = signed(Value::Object(replay.clone()));
         let artifact = ReplayArtifact::from_slice(&serde_json::to_vec(&artifact).unwrap()).unwrap();
@@ -1267,11 +1270,11 @@ mod tests {
         replay.insert(
             "globalState".to_owned(),
             json!({
-                "setTerrain": [[0, 1, 1, 2], [false, true], [], []]
+                "setTerrain": [[0, 1, 1, 2], [false, true], [], [], []]
             }),
         );
         replay["entities"][0]["properties"] = json!({
-            "type": [[0, 2], ["unit"], [], []]
+            "type": [[0, 2], ["unit"], [], [], []]
         });
         artifact["replay"] = signed(Value::Object(replay.clone()));
         let artifact = ReplayArtifact::from_slice(&serde_json::to_vec(&artifact).unwrap()).unwrap();
@@ -1309,13 +1312,13 @@ mod tests {
         replay.insert(
             "globalState".to_owned(),
             json!({
-                "setTerrain": [[0, 1, 1, 2], [true, false], [], []]
+                "setTerrain": [[0, 1, 1, 2], [true, false], [], [], []]
             }),
         );
         replay["entities"][0]["properties"] = json!({
-            "type": [[0, 1, 1, 2], ["wall", "creep"], [], []],
-            "x": [[0, 2], [2], [], []],
-            "y": [[0, 2], [2], [], []]
+            "type": [[0, 1, 1, 2], ["wall", "creep"], [], [], []],
+            "x": [[0, 2], [2], [], [], []],
+            "y": [[0, 2], [2], [], [], []]
         });
         artifact["replay"] = signed(Value::Object(replay.clone()));
         let artifact = ReplayArtifact::from_slice(&serde_json::to_vec(&artifact).unwrap()).unwrap();
@@ -1347,13 +1350,13 @@ mod tests {
         replay.insert(
             "globalState".to_owned(),
             json!({
-                "setTerrain": [[0, 1, 1, 2], [true, false], [], []]
+                "setTerrain": [[0, 1, 1, 2], [true, false], [], [], []]
             }),
         );
         replay["entities"][0]["properties"] = json!({
-            "type": [[0, 2], ["constructedWall"], [], []],
-            "x": [[0, 2], [2], [], []],
-            "y": [[0, 2], [2], [], []]
+            "type": [[0, 2], ["constructedWall"], [], [], []],
+            "x": [[0, 2], [2], [], [], []],
+            "y": [[0, 2], [2], [], [], []]
         });
         artifact["replay"] = signed(Value::Object(replay.clone()));
         let artifact = ReplayArtifact::from_slice(&serde_json::to_vec(&artifact).unwrap()).unwrap();
@@ -1400,9 +1403,9 @@ mod tests {
             contract_fingerprint,
         );
         replay["entities"][0]["properties"] = json!({
-            "type": [[0, 1], ["wall"], [], []],
-            "x": [[0, 2], [2], [], []],
-            "y": [[0, 2], [2], [], []]
+            "type": [[0, 1], ["wall"], [], [], []],
+            "x": [[0, 2], [2], [], [], []],
+            "y": [[0, 2], [2], [], [], []]
         });
         artifact["replay"] = signed(Value::Object(replay.clone()));
         let artifact = ReplayArtifact::from_slice(&serde_json::to_vec(&artifact).unwrap()).unwrap();

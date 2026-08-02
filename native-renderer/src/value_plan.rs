@@ -4,12 +4,19 @@ use serde_json::Value;
 
 use crate::{Error, Result};
 
-pub const RETAINED_EXPRESSION_OPERATORS: [&str; 5] =
-    ["$calc", "$processorParam", "$random", "$rel", "$state"];
+pub const RETAINED_EXPRESSION_OPERATORS: [&str; 6] = [
+    "$calc",
+    "$idx",
+    "$processorParam",
+    "$random",
+    "$rel",
+    "$state",
+];
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ExpressionOperator {
     Calculation,
+    Index,
     ProcessorParameter,
     Random,
     Relative,
@@ -53,29 +60,67 @@ pub enum ResolvedValue {
 }
 
 fn js_number_string(value: f64) -> Result<String> {
-    if !value.is_finite() {
-        return Err(Error::Invalid(
-            "JavaScript property-key number must be finite".to_owned(),
-        ));
+    if value.is_nan() {
+        return Ok("NaN".to_owned());
+    }
+    if value == f64::INFINITY {
+        return Ok("Infinity".to_owned());
+    }
+    if value == f64::NEG_INFINITY {
+        return Ok("-Infinity".to_owned());
     }
     if value == 0.0 {
         return Ok("0".to_owned());
     }
-    let absolute = value.abs();
-    if !(1e-6..1e21).contains(&absolute) {
-        let raw = format!("{value:e}");
-        let (coefficient, exponent) = raw
-            .split_once('e')
-            .expect("Rust scientific formatting includes an exponent");
-        let exponent = exponent.parse::<i32>().map_err(|_| {
-            Error::Invalid("failed to format JavaScript numeric property key".to_owned())
-        })?;
-        return Ok(format!(
-            "{coefficient}e{}{exponent}",
-            if exponent >= 0 { "+" } else { "" }
-        ));
+    Ok(ryu_js::Buffer::new().format_finite(value).to_owned())
+}
+
+fn canonical_array_index(key: &str) -> Option<usize> {
+    if key == "0" {
+        return Some(0);
     }
-    Ok(value.to_string())
+    if key.starts_with('0') || !key.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let index = key.parse::<u32>().ok()?;
+    (index != u32::MAX).then_some(index as usize)
+}
+
+fn index_property(target: &ResolvedValue, key: &str) -> Result<ResolvedValue> {
+    Ok(match target {
+        ResolvedValue::Object(values) => {
+            values.get(key).cloned().unwrap_or(ResolvedValue::Undefined)
+        }
+        ResolvedValue::Array(values) if key == "length" => {
+            ResolvedValue::Number(values.len() as f64)
+        }
+        ResolvedValue::Array(values) => canonical_array_index(key)
+            .and_then(|index| values.get(index))
+            .cloned()
+            .unwrap_or(ResolvedValue::Undefined),
+        ResolvedValue::String(value) if key == "length" => {
+            ResolvedValue::Number(value.encode_utf16().count() as f64)
+        }
+        ResolvedValue::String(value) => {
+            let Some(index) = canonical_array_index(key) else {
+                return Ok(ResolvedValue::Undefined);
+            };
+            let Some(unit) = value.encode_utf16().nth(index) else {
+                return Ok(ResolvedValue::Undefined);
+            };
+            let character = char::decode_utf16([unit])
+                .next()
+                .expect("one UTF-16 unit was supplied")
+                .map_err(|_| {
+                    Error::Invalid(
+                        "renderer $idx produced a lone UTF-16 surrogate unsupported by ReplayIR"
+                            .to_owned(),
+                    )
+                })?;
+            ResolvedValue::String(character.to_string())
+        }
+        _ => ResolvedValue::Undefined,
+    })
 }
 
 pub(crate) fn js_property_key(value: &ResolvedValue) -> Result<String> {
@@ -150,6 +195,7 @@ impl ExpressionOperator {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Calculation => "$calc",
+            Self::Index => "$idx",
             Self::ProcessorParameter => "$processorParam",
             Self::Random => "$random",
             Self::Relative => "$rel",
@@ -164,6 +210,7 @@ impl TryFrom<&str> for ExpressionOperator {
     fn try_from(value: &str) -> Result<Self> {
         match value {
             "$calc" => Ok(Self::Calculation),
+            "$idx" => Ok(Self::Index),
             "$processorParam" => Ok(Self::ProcessorParameter),
             "$random" => Ok(Self::Random),
             "$rel" => Ok(Self::Relative),
@@ -332,6 +379,20 @@ impl ExpressionPlan {
             }
             return Ok(ResolvedValue::Number(value * range));
         }
+        if self.operator == ExpressionOperator::Index {
+            let ResolvedValue::Array(parameters) = parameter else {
+                return Err(Error::Invalid(
+                    "renderer $idx expects [target, key]".to_owned(),
+                ));
+            };
+            if parameters.len() < 2 {
+                return Err(Error::Invalid(
+                    "renderer $idx expects [target, key]".to_owned(),
+                ));
+            }
+            let key = js_property_key(&parameters[1])?;
+            return index_property(&parameters[0], &key);
+        }
 
         let path = parameter.as_string().ok_or_else(|| {
             Error::Invalid(format!(
@@ -341,6 +402,7 @@ impl ExpressionPlan {
         })?;
         let root = match self.operator {
             ExpressionOperator::Calculation => context.calculations,
+            ExpressionOperator::Index => unreachable!("handled above"),
             ExpressionOperator::ProcessorParameter => context.processor_parameters,
             ExpressionOperator::Relative => context.relative.unwrap_or(&ResolvedValue::Undefined),
             ExpressionOperator::State => context.state,
@@ -392,6 +454,57 @@ impl ResolvedValue {
                 .collect::<Result<BTreeMap<_, _>>>()
                 .map(Self::Object),
         }
+    }
+
+    /// Decode ReplayIR calculation output. JavaScript calculations may
+    /// legitimately produce NaN or infinities even when a processor's `when`
+    /// predicate prevents the value from reaching a drawable. JSON cannot
+    /// represent those values directly, so calculation tracks use a separate
+    /// pointer sidecar while ordinary replay-state tracks stay strict JSON.
+    pub fn from_calculation_json(value: &Value, non_finite: &[(&str, i8)]) -> Result<Self> {
+        fn decode(
+            value: &Value,
+            pointer: &str,
+            non_finite: &[(&str, i8)],
+        ) -> Result<ResolvedValue> {
+            if let Some((_, code)) = non_finite.iter().find(|(path, _)| *path == pointer) {
+                if value != &Value::Null {
+                    return Err(Error::Invalid(
+                        "non-finite calculation placeholder is not null".to_owned(),
+                    ));
+                }
+                return Ok(ResolvedValue::Number(match code {
+                    -1 => f64::NEG_INFINITY,
+                    0 => f64::NAN,
+                    1 => f64::INFINITY,
+                    _ => {
+                        return Err(Error::Invalid(
+                            "non-finite calculation code is invalid".to_owned(),
+                        ));
+                    }
+                }));
+            }
+            match value {
+                Value::Array(values) => values
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| decode(value, &format!("{pointer}/{index}"), non_finite))
+                    .collect::<Result<Vec<_>>>()
+                    .map(ResolvedValue::Array),
+                Value::Object(object) => object
+                    .iter()
+                    .map(|(key, value)| {
+                        let token = key.replace('~', "~0").replace('/', "~1");
+                        decode(value, &format!("{pointer}/{token}"), non_finite)
+                            .map(|value| (key.clone(), value))
+                    })
+                    .collect::<Result<BTreeMap<_, _>>>()
+                    .map(ResolvedValue::Object),
+                _ => ResolvedValue::from_json(value),
+            }
+        }
+
+        decode(value, "", non_finite)
     }
 
     pub const fn as_number(&self) -> Option<f64> {
@@ -491,7 +604,7 @@ mod tests {
 
     use std::collections::BTreeMap;
 
-    use super::{js_property_key, resolved_js_truthy};
+    use super::{index_property, js_property_key, resolved_js_truthy};
     use crate::{
         CompiledValue, ExpressionOperator, RETAINED_EXPRESSION_OPERATORS, ResolvedValue,
         ValueContext,
@@ -501,6 +614,14 @@ mod tests {
     fn coerces_plain_json_values_to_javascript_property_keys() {
         assert_eq!(js_property_key(&ResolvedValue::Number(7.0)).unwrap(), "7");
         assert_eq!(js_property_key(&ResolvedValue::Number(-0.0)).unwrap(), "0");
+        assert_eq!(
+            js_property_key(&ResolvedValue::Number(f64::NAN)).unwrap(),
+            "NaN"
+        );
+        assert_eq!(
+            js_property_key(&ResolvedValue::Number(f64::INFINITY)).unwrap(),
+            "Infinity"
+        );
         assert_eq!(
             js_property_key(&ResolvedValue::Number(1e21)).unwrap(),
             "1e+21"
@@ -536,12 +657,42 @@ mod tests {
     }
 
     #[test]
+    fn index_properties_follow_javascript_array_and_string_own_properties() {
+        let array = ResolvedValue::Array(vec![
+            ResolvedValue::String("A".to_owned()),
+            ResolvedValue::String("B".to_owned()),
+        ]);
+        assert_eq!(
+            index_property(&array, "1").unwrap(),
+            ResolvedValue::String("B".to_owned())
+        );
+        assert_eq!(
+            index_property(&array, "01").unwrap(),
+            ResolvedValue::Undefined
+        );
+        assert_eq!(
+            index_property(&array, "length").unwrap(),
+            ResolvedValue::Number(2.0)
+        );
+
+        let string = ResolvedValue::String("Aé".to_owned());
+        assert_eq!(
+            index_property(&string, "1").unwrap(),
+            ResolvedValue::String("é".to_owned())
+        );
+        assert_eq!(
+            index_property(&string, "length").unwrap(),
+            ResolvedValue::Number(2.0)
+        );
+    }
+
+    #[test]
     fn recognizes_every_retained_expression_operator() {
         let operators = RETAINED_EXPRESSION_OPERATORS
             .iter()
             .map(|operator| ExpressionOperator::try_from(*operator).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(operators.len(), 5);
+        assert_eq!(operators.len(), 6);
     }
 
     #[test]
@@ -598,6 +749,10 @@ mod tests {
         let state = ResolvedValue::Object(BTreeMap::from([
             ("x".to_owned(), ResolvedValue::Number(4.0)),
             (
+                "bodyPartType".to_owned(),
+                ResolvedValue::String("heal".to_owned()),
+            ),
+            (
                 "nested".to_owned(),
                 ResolvedValue::Object(BTreeMap::from([(
                     "value".to_owned(),
@@ -627,6 +782,10 @@ mod tests {
                 {"$processorParam": "tickDuration"},
                 {"$state": "nested[value]"},
                 {"$state": "falsy.missing"},
+                {"$idx": [
+                    {"attack": 16199233, "heal": 5688990},
+                    {"$state": "bodyPartType"}
+                ]},
                 {"$random": 8}
             ]),
             "expressions",
@@ -644,6 +803,7 @@ mod tests {
                 ResolvedValue::Number(0.25),
                 ResolvedValue::Number(3.0),
                 ResolvedValue::Number(0.0),
+                ResolvedValue::Number(5_688_990.0),
                 ResolvedValue::Number(2.0),
             ]
         );

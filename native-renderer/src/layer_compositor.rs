@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{
     EncodedTemporalBatch, Error, PIXI_COLOR_FORMAT, Result, SpritePipeline, TemporalTarget,
@@ -42,6 +43,8 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
+static LAYER_COMPOSITOR_ID: AtomicU64 = AtomicU64::new(1);
+
 struct LightingCompositeSlot {
     target: TemporalTarget,
     bind_group: wgpu::BindGroup,
@@ -53,10 +56,23 @@ struct LightingCompositeSlot {
 /// then multiplies that complete layer over the main scene target.
 pub struct TemporalLayerCompositor {
     slots: Vec<LightingCompositeSlot>,
+    bind_group_layout: wgpu::BindGroupLayout,
     pipeline: wgpu::RenderPipeline,
     width: u32,
     height: u32,
     layers: NonZeroU32,
+    identity: u64,
+}
+
+/// A compositor binding for a resident lighting array that can be reused
+/// without copying it through a per-submission scratch target.
+pub struct TemporalLightingSource {
+    bind_group: wgpu::BindGroup,
+    width: u32,
+    height: u32,
+    layers: NonZeroU32,
+    format: wgpu::TextureFormat,
+    compositor_identity: u64,
 }
 
 impl TemporalLayerCompositor {
@@ -67,6 +83,11 @@ impl TemporalLayerCompositor {
         layers: NonZeroU32,
         slot_count: NonZeroU32,
     ) -> Result<Self> {
+        let identity = LAYER_COMPOSITOR_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| Error::ArithmeticOverflow)?;
         if width == 0 || height == 0 {
             return Err(Error::Invalid(
                 "layer compositor dimensions must be positive".to_owned(),
@@ -162,10 +183,36 @@ impl TemporalLayerCompositor {
         }
         Ok(Self {
             slots,
+            bind_group_layout,
             pipeline,
             width,
             height,
             layers,
+            identity,
+        })
+    }
+
+    pub fn create_lighting_source(
+        &self,
+        device: &wgpu::Device,
+        target: &TemporalTarget,
+    ) -> Result<TemporalLightingSource> {
+        self.validate_target(target)?;
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("resident temporal lighting composite binding"),
+            layout: &self.bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&target.view),
+            }],
+        });
+        Ok(TemporalLightingSource {
+            bind_group,
+            width: target.width,
+            height: target.height,
+            layers: target.layers,
+            format: target.format,
+            compositor_identity: self.identity,
         })
     }
 
@@ -184,6 +231,38 @@ impl TemporalLayerCompositor {
         target: &TemporalTarget,
         load: wgpu::LoadOp<wgpu::Color>,
     ) -> Result<()> {
+        self.validate_target(target)?;
+        let slot = self
+            .slots
+            .get(slot_index)
+            .ok_or_else(|| Error::Invalid(format!("invalid compositor slot {slot_index}")))?;
+        self.encode_source_into(encoder, target, &slot.bind_group, load);
+        Ok(())
+    }
+
+    pub(crate) fn encode_resident_lighting_composite_into(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        source: &TemporalLightingSource,
+        target: &TemporalTarget,
+        load: wgpu::LoadOp<wgpu::Color>,
+    ) -> Result<()> {
+        self.validate_target(target)?;
+        if source.compositor_identity != self.identity
+            || source.width != self.width
+            || source.height != self.height
+            || source.layers != self.layers
+            || source.format != PIXI_COLOR_FORMAT
+        {
+            return Err(Error::Invalid(
+                "resident lighting source and compositor differ".to_owned(),
+            ));
+        }
+        self.encode_source_into(encoder, target, &source.bind_group, load);
+        Ok(())
+    }
+
+    fn validate_target(&self, target: &TemporalTarget) -> Result<()> {
         if target.width != self.width
             || target.height != self.height
             || target.layers != self.layers
@@ -193,10 +272,16 @@ impl TemporalLayerCompositor {
                 "lighting composite and scene targets differ".to_owned(),
             ));
         }
-        let slot = self
-            .slots
-            .get(slot_index)
-            .ok_or_else(|| Error::Invalid(format!("invalid compositor slot {slot_index}")))?;
+        Ok(())
+    }
+
+    fn encode_source_into(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &TemporalTarget,
+        bind_group: &wgpu::BindGroup,
+        load: wgpu::LoadOp<wgpu::Color>,
+    ) {
         let attachment = Some(wgpu::RenderPassColorAttachment {
             view: &target.view,
             depth_slice: None,
@@ -214,9 +299,8 @@ impl TemporalLayerCompositor {
             occlusion_query_set: None,
         });
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &slot.bind_group, &[]);
+        pass.set_bind_group(0, bind_group, &[]);
         pass.draw(0..3, 0..1);
-        Ok(())
     }
 }
 

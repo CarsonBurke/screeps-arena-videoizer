@@ -632,7 +632,7 @@ mod tests {
         let contract_fingerprint = root["rendererContract"]["fingerprint"].clone();
 
         root["replay"]["rendererContractFingerprint"] = contract_fingerprint;
-        root["replay"]["entities"][0]["properties"]["type"] = json!([[0, 2], ["unit"], [], []]);
+        root["replay"]["entities"][0]["properties"]["type"] = json!([[0, 2], ["unit"], [], [], []]);
         root["replay"]["rendererGraph"] = json!({
             "columns": [
                 [0, 0, 0, 0, 0],
@@ -685,7 +685,7 @@ mod tests {
     #[test]
     fn rejects_lifecycle_that_disagrees_with_entity_lifetimes() {
         let mut root: Value = serde_json::from_slice(&artifact_json()).unwrap();
-        root["replay"]["entities"][0]["properties"]["type"] = json!([[0, 2], ["unit"], [], []]);
+        root["replay"]["entities"][0]["properties"]["type"] = json!([[0, 2], ["unit"], [], [], []]);
         root["replay"]["rendererGraph"] = json!({
             "columns": [[0, 0], [3, 4], [-1, -1], [-1, -1]],
             "enabled": true,
@@ -721,7 +721,7 @@ mod tests {
         let contract_fingerprint = root["rendererContract"]["fingerprint"].clone();
 
         root["replay"]["rendererContractFingerprint"] = contract_fingerprint;
-        root["replay"]["entities"][0]["properties"]["type"] = json!([[0, 2], ["unit"], [], []]);
+        root["replay"]["entities"][0]["properties"]["type"] = json!([[0, 2], ["unit"], [], [], []]);
         root["replay"]["rendererGraph"] = json!({
             "columns": [[0, 0, 0], [3, 7, 7], [-1, 1, 0], [-1, -1, -1]],
             "enabled": true,
@@ -774,7 +774,7 @@ mod tests {
         let contract_fingerprint = root["rendererContract"]["fingerprint"].clone();
 
         root["replay"]["rendererContractFingerprint"] = contract_fingerprint;
-        root["replay"]["entities"][0]["properties"]["type"] = json!([[0, 2], ["unit"], [], []]);
+        root["replay"]["entities"][0]["properties"]["type"] = json!([[0, 2], ["unit"], [], [], []]);
         root["replay"]["rendererGraph"] = json!({
             "columns": [[0, 0, 0], [3, 7, 7], [-1, 1, 0], [-1, -1, -1]],
             "enabled": true,

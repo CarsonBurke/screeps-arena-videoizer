@@ -68,6 +68,20 @@ pub fn procedural_graphics_assets(
             })
             .collect::<Result<Vec<_>>>()?,
     );
+    assets.extend(crate::text_raster::text_raster_assets(
+        scene.activations.iter().filter_map(|activation| {
+            let ResolvedActivation::Processor {
+                kind: ProcessorKind::Text,
+                payload,
+                ..
+            } = activation
+            else {
+                return None;
+            };
+            (payload.get("$nativeTextRaster") == Some(&ResolvedValue::Bool(true)))
+                .then(|| payload.clone())
+        }),
+    )?);
     Ok(assets)
 }
 
