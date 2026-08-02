@@ -318,6 +318,9 @@ impl<'a> GenericSceneRuntime<'a> {
         for vector in &mut vectors {
             let rank = self.display_ranks[&vector.activation_order];
             vector.layer_order = self.display_order[rank].layer_order;
+            if self.plan.layer_orders.get("lighting").copied() == Some(vector.layer_order) {
+                vector.blend_mode = crate::SpriteBlendMode::Screen;
+            }
         }
         Ok(vectors)
     }
@@ -335,6 +338,7 @@ impl<'a> GenericSceneRuntime<'a> {
             board,
             &self.action_manager,
             &self.sprite_display_order,
+            self.plan.layer_orders.get("lighting").copied(),
             scratch,
         )
     }

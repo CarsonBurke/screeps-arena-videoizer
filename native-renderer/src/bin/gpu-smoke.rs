@@ -385,6 +385,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             compositor: &compositor,
             terrain: &scene_terrain,
             scene: &scene_batch,
+            lighting_layer_order: None,
             clear_color: wgpu::Color::TRANSPARENT,
             terrain_cache: None,
         },

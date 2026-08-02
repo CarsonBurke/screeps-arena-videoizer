@@ -57,6 +57,7 @@ struct LightingCompositeSlot {
 pub struct TemporalLayerCompositor {
     slots: Vec<LightingCompositeSlot>,
     bind_group_layout: wgpu::BindGroupLayout,
+    copy_pipeline: wgpu::RenderPipeline,
     pipeline: wgpu::RenderPipeline,
     width: u32,
     height: u32,
@@ -142,31 +143,35 @@ impl TemporalLayerCompositor {
             label: Some("lighting composite shader"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(LAYER_COMPOSITE_SHADER)),
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("multiply lighting layer composite"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vertex_main"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fragment_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: PIXI_COLOR_FORMAT,
-                    blend: Some(multiply_blend()),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview: Some(layers),
-            cache: None,
-        });
+        let create_pipeline = |label, blend| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vertex_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fragment_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: PIXI_COLOR_FORMAT,
+                        blend,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview: Some(layers),
+                cache: None,
+            })
+        };
+        let copy_pipeline = create_pipeline("copy lighting layer", None);
+        let pipeline = create_pipeline("multiply lighting layer composite", Some(multiply_blend()));
 
         let mut slots = Vec::with_capacity(slot_count.get() as usize);
         for _ in 0..slot_count.get() {
@@ -184,6 +189,7 @@ impl TemporalLayerCompositor {
         Ok(Self {
             slots,
             bind_group_layout,
+            copy_pipeline,
             pipeline,
             width,
             height,
@@ -262,6 +268,36 @@ impl TemporalLayerCompositor {
         Ok(())
     }
 
+    pub(crate) fn encode_resident_lighting_to_slot(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        source: &TemporalLightingSource,
+        slot_index: usize,
+    ) -> Result<()> {
+        if source.compositor_identity != self.identity
+            || source.width != self.width
+            || source.height != self.height
+            || source.layers != self.layers
+            || source.format != PIXI_COLOR_FORMAT
+        {
+            return Err(Error::Invalid(
+                "resident lighting source and compositor differ".to_owned(),
+            ));
+        }
+        let slot = self
+            .slots
+            .get(slot_index)
+            .ok_or_else(|| Error::Invalid(format!("invalid compositor slot {slot_index}")))?;
+        self.encode_source_with_pipeline(
+            encoder,
+            &slot.target,
+            &source.bind_group,
+            &self.copy_pipeline,
+            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+        );
+        Ok(())
+    }
+
     fn validate_target(&self, target: &TemporalTarget) -> Result<()> {
         if target.width != self.width
             || target.height != self.height
@@ -282,6 +318,17 @@ impl TemporalLayerCompositor {
         bind_group: &wgpu::BindGroup,
         load: wgpu::LoadOp<wgpu::Color>,
     ) {
+        self.encode_source_with_pipeline(encoder, target, bind_group, &self.pipeline, load);
+    }
+
+    fn encode_source_with_pipeline(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &TemporalTarget,
+        bind_group: &wgpu::BindGroup,
+        pipeline: &wgpu::RenderPipeline,
+        load: wgpu::LoadOp<wgpu::Color>,
+    ) {
         let attachment = Some(wgpu::RenderPassColorAttachment {
             view: &target.view,
             depth_slice: None,
@@ -298,7 +345,7 @@ impl TemporalLayerCompositor {
             timestamp_writes: None,
             occlusion_query_set: None,
         });
-        pass.set_pipeline(&self.pipeline);
+        pass.set_pipeline(pipeline);
         pass.set_bind_group(0, bind_group, &[]);
         pass.draw(0..3, 0..1);
     }

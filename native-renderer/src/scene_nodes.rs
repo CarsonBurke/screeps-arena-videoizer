@@ -300,7 +300,7 @@ impl SceneNodeTemplates {
                         program,
                         mesh,
                         tint: color(payload.get("tint"), 0x00ff_ffff, "draw tint")?,
-                        blend_mode: blend_mode(payload.get("blendMode"))?,
+                        blend_mode: layer_blend_mode(payload.get("blendMode"), layer.as_deref())?,
                         blur: optional_optional_number(payload.get("blur"), "draw blur")?,
                     }
                 }
@@ -334,6 +334,7 @@ impl SceneNodeTemplates {
                         entry,
                         common.scale,
                         *kind == ProcessorKind::Text,
+                        layer.as_deref(),
                     )?
                 }
                 ProcessorKind::Circle
@@ -353,7 +354,7 @@ impl SceneNodeTemplates {
                         anchor: [0.5, 0.5],
                         pixel_snap: false,
                         tint: color(payload.get("tint"), 0x00ff_ffff, "circle tint")?,
-                        blend_mode: blend_mode(payload.get("blendMode"))?,
+                        blend_mode: layer_blend_mode(payload.get("blendMode"), layer.as_deref())?,
                         blur: optional_optional_number(payload.get("blur"), "circle blur")?,
                     }
                 }
@@ -539,6 +540,7 @@ impl SceneNodeTemplates {
         board: BoardTransform,
         action_manager: &ActionManagerRuntime,
         sprite_display_order: &[SpriteDisplayEntry],
+        lighting_layer_order: Option<u32>,
         scratch: &'s mut SceneFrameScratch,
     ) -> Result<&'s [PreparedSpriteInstance]> {
         scratch.transforms.clear();
@@ -604,7 +606,11 @@ impl SceneNodeTemplates {
             scratch.instances.push(PreparedSpriteInstance {
                 activation_order: node.activation_order,
                 layer_order: entry.layer_order,
-                blend_mode,
+                blend_mode: if Some(entry.layer_order) == lighting_layer_order {
+                    SpriteBlendMode::Screen
+                } else {
+                    blend_mode
+                },
                 instance: sprite_instance(SpriteInstanceParameters {
                     transform: maybe_snap_text_transform(
                         pixel_snap,
@@ -1087,6 +1093,7 @@ fn sprite_kind(
     entry: AtlasEntry,
     initial_scale: [f64; 2],
     pixel_snap: bool,
+    layer: Option<&str>,
 ) -> Result<SceneNodeKind> {
     let natural_size = [
         f64::from(entry.logical_width),
@@ -1104,9 +1111,17 @@ fn sprite_kind(
         anchor,
         pixel_snap,
         tint: color(payload.get("tint"), 0x00ff_ffff, "sprite tint")?,
-        blend_mode: blend_mode(payload.get("blendMode"))?,
+        blend_mode: layer_blend_mode(payload.get("blendMode"), layer)?,
         blur: optional_optional_number(payload.get("blur"), "sprite blur")?,
     })
+}
+
+fn layer_blend_mode(value: Option<&ResolvedValue>, layer: Option<&str>) -> Result<SpriteBlendMode> {
+    if layer == Some("lighting") {
+        Ok(SpriteBlendMode::Screen)
+    } else {
+        blend_mode(value)
+    }
 }
 
 fn effective_texture<'a>(
@@ -1436,6 +1451,7 @@ mod tests {
                     activation_order: node.activation_order,
                     layer_order: 0,
                 }],
+                None,
                 &mut scratch,
             )
             .unwrap();
@@ -1443,6 +1459,25 @@ mod tests {
         assert_eq!(direct[0].activation_order, node.activation_order);
         assert_eq!(direct[0].blend_mode, SpriteBlendMode::Screen);
         assert_eq!(direct[0].instance, prepared[0].gpu_instance().unwrap());
+
+        let mut inherited_lighting = templates.clone();
+        let SceneNodeKind::Sprite { blend_mode, .. } = &mut inherited_lighting.nodes[1].kind else {
+            panic!("expected sprite")
+        };
+        *blend_mode = SpriteBlendMode::Normal;
+        let inherited = inherited_lighting
+            .prepare_gpu_instances_with_action_manager(
+                board,
+                &manager,
+                &[SpriteDisplayEntry {
+                    activation_order: node.activation_order,
+                    layer_order: 3,
+                }],
+                Some(3),
+                &mut scratch,
+            )
+            .unwrap();
+        assert_eq!(inherited[0].blend_mode, SpriteBlendMode::Screen);
 
         manager.destroy_target(node.activation_order).unwrap();
         assert!(
@@ -1460,6 +1495,7 @@ mod tests {
                         activation_order: node.activation_order,
                         layer_order: 0,
                     }],
+                    None,
                     &mut scratch,
                 )
                 .unwrap()

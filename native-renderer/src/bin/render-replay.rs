@@ -872,6 +872,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         compositor: &compositor,
                         terrain: &terrain_batch,
                         scene: &scene_batch,
+                        lighting_layer_order: renderer_plan.layer_orders.get("lighting").copied(),
                         clear_color,
                         terrain_cache: terrain_cache.as_ref().map(|cache| TemporalTerrainCache {
                             prefix: &cache.prefix,
@@ -1091,6 +1092,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     compositor: &compositor,
                     terrain: &terrain_batch,
                     scene: &scene_batch,
+                    lighting_layer_order: renderer_plan.layer_orders.get("lighting").copied(),
                     clear_color,
                     terrain_cache: None,
                 },

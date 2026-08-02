@@ -439,6 +439,10 @@ pub struct TemporalRenderBatch<'a> {
     pub compositor: &'a crate::TemporalLayerCompositor,
     pub terrain: &'a crate::TemporalTerrainSceneBatch,
     pub scene: &'a crate::TemporalSceneBatch,
+    /// Metadata order of the filtered `lighting` layer. Drawables before it
+    /// target the main scene, drawables on it target the lighting
+    /// intermediate, and later drawables are composited afterward.
+    pub lighting_layer_order: Option<u32>,
     pub clear_color: wgpu::Color,
     /// Optional pre-rendered static terrain prefix and lighting layer. When
     /// present, `terrain` contains only the ordered dynamic remainder.
@@ -1815,6 +1819,7 @@ impl TemporalSubmission<'_> {
             compositor,
             terrain,
             scene,
+            lighting_layer_order,
             clear_color,
             terrain_cache,
         } = parameters;
@@ -1831,7 +1836,19 @@ impl TemporalSubmission<'_> {
                 "resident and dynamic terrain lighting cannot be supplied together".to_owned(),
             ));
         }
+        validate_scene_display_order(scene)?;
+        let scene_has_lighting = lighting_layer_order.is_some_and(|layer| {
+            scene
+                .display_order
+                .iter()
+                .any(|entry| entry.layer_order == layer)
+        });
         let has_lighting = resident_lighting.is_some() || terrain.lighting.is_some();
+        if has_lighting && lighting_layer_order.is_none() {
+            return Err(Error::Invalid(
+                "terrain lighting exists without a renderer lighting layer".to_owned(),
+            ));
+        }
         let lighting_composite_supported =
             matches!(
                 (has_lighting, terrain.lighting_composite),
@@ -1913,20 +1930,55 @@ impl TemporalSubmission<'_> {
             )?;
             scene_load = wgpu::LoadOp::Load;
         }
-        let encoded =
-            self.encode_leased_scene_batch(queue, vector_pipeline, lease, scene, scene_load)?;
-        if let Some(source) = resident_lighting {
-            let target = &self.renderer.slots[encoded.slot_index].target;
+        let encoded = self.prepare_leased_batch(queue, lease, &scene.sprites)?;
+        let main_target = &self.renderer.slots[encoded.slot_index].target;
+        if vector_pipeline.output_size() != [main_target.width, main_target.height] {
+            return Err(Error::Invalid(
+                "vector pipeline dimensions differ from the temporal scene target".to_owned(),
+            ));
+        }
+        let vectors = vector_pipeline.prepare_batch(queue, encoded.slot_index, &scene.vectors)?;
+        {
             let encoder = self
                 .encoder
                 .as_mut()
                 .expect("submission retains its encoder until submit");
-            compositor.encode_resident_lighting_composite_into(
+            self.renderer.encode_runs_into_slot(
                 encoder,
-                source,
+                encoded.slot_index,
+                None,
+                std::iter::empty(),
+                scene_load,
+            )?;
+        }
+        let (before_lighting, lighting_entries, after_lighting) =
+            partition_scene_display_order(&scene.display_order, lighting_layer_order)?;
+        {
+            let renderer = &*self.renderer;
+            let target = &renderer.slots[encoded.slot_index].target.view;
+            let encoder = self
+                .encoder
+                .as_mut()
+                .expect("submission retains its encoder until submit");
+            encode_scene_entries(
+                renderer,
+                encoder,
+                &encoded,
+                vector_pipeline,
+                &vectors,
+                before_lighting,
                 target,
                 wgpu::LoadOp::Load,
             )?;
+        }
+        if let Some(source) = resident_lighting
+            && scene_has_lighting
+        {
+            let encoder = self
+                .encoder
+                .as_mut()
+                .expect("submission retains its encoder until submit");
+            compositor.encode_resident_lighting_to_slot(encoder, source, encoded.slot_index)?;
         } else if let Some(lighting) = &terrain.lighting {
             let target = compositor.lighting_target(&encoded)?;
             if lighting.frame.output_size != [target.width as f32, target.height as f32]
@@ -1954,7 +2006,41 @@ impl TemporalSubmission<'_> {
                 },
             )?;
         }
-        if has_lighting && resident_lighting.is_none() {
+        if scene_has_lighting && has_lighting {
+            let target = compositor.lighting_target(&encoded)?;
+            let renderer = &*self.renderer;
+            let encoder = self
+                .encoder
+                .as_mut()
+                .expect("submission retains its encoder until submit");
+            encode_scene_entries(
+                renderer,
+                encoder,
+                &encoded,
+                vector_pipeline,
+                &vectors,
+                lighting_entries,
+                &target.view,
+                wgpu::LoadOp::Load,
+            )?;
+        }
+        if let Some(source) = resident_lighting {
+            if scene_has_lighting {
+                self.encode_lighting_composite(compositor, &encoded, wgpu::LoadOp::Load)?;
+            } else {
+                let target = &self.renderer.slots[encoded.slot_index].target;
+                let encoder = self
+                    .encoder
+                    .as_mut()
+                    .expect("submission retains its encoder until submit");
+                compositor.encode_resident_lighting_composite_into(
+                    encoder,
+                    source,
+                    target,
+                    wgpu::LoadOp::Load,
+                )?;
+            }
+        } else if has_lighting {
             self.encode_lighting_composite(compositor, &encoded, wgpu::LoadOp::Load)?;
         }
         if let Some(effects) = &terrain.effects {
@@ -1971,6 +2057,24 @@ impl TemporalSubmission<'_> {
                     runs: &effects.runs,
                     load: wgpu::LoadOp::Load,
                 },
+            )?;
+        }
+        {
+            let renderer = &*self.renderer;
+            let target = &renderer.slots[encoded.slot_index].target.view;
+            let encoder = self
+                .encoder
+                .as_mut()
+                .expect("submission retains its encoder until submit");
+            encode_scene_entries(
+                renderer,
+                encoder,
+                &encoded,
+                vector_pipeline,
+                &vectors,
+                after_lighting,
+                target,
+                wgpu::LoadOp::Load,
             )?;
         }
         Ok(encoded)
@@ -2111,31 +2215,7 @@ impl TemporalSubmission<'_> {
                 "heterogeneous scene batch has inconsistent active views".to_owned(),
             ));
         }
-        let mut seen = BTreeSet::new();
-        let mut display_sprites = BTreeSet::new();
-        let mut display_vectors = BTreeSet::new();
-        for entry in &batch.display_order {
-            if !seen.insert((entry.activation_order, entry.kind)) {
-                return Err(Error::Invalid(
-                    "heterogeneous scene display order repeats a drawable identity".to_owned(),
-                ));
-            }
-            match entry.kind {
-                crate::SceneDrawableKind::Sprite => {
-                    display_sprites.insert(entry.activation_order);
-                }
-                crate::SceneDrawableKind::Vector => {
-                    display_vectors.insert(entry.activation_order);
-                }
-            }
-        }
-        if display_sprites != batch.sprites.slot_activations.iter().copied().collect()
-            || display_vectors != batch.vectors.slot_activations.iter().copied().collect()
-        {
-            return Err(Error::Invalid(
-                "heterogeneous scene display order does not cover its packed drawables".to_owned(),
-            ));
-        }
+        validate_scene_display_order(batch)?;
         let encoded = self.prepare_leased_batch(queue, lease, &batch.sprites)?;
         let target = &self.renderer.slots[encoded.slot_index].target;
         if vector_pipeline.output_size() != [target.width, target.height] {
@@ -2157,37 +2237,23 @@ impl TemporalSubmission<'_> {
                 initial_load,
             )?;
         }
-        let mut start = 0;
-        while start < batch.display_order.len() {
-            let kind = batch.display_order[start].kind;
-            let mut end = start + 1;
-            while end < batch.display_order.len() && batch.display_order[end].kind == kind {
-                end += 1;
-            }
-            let activation_orders = batch.display_order[start..end]
-                .iter()
-                .map(|entry| entry.activation_order)
-                .collect::<Vec<_>>();
-            match kind {
-                crate::SceneDrawableKind::Sprite => {
-                    self.encode_sprite_activations(
-                        &encoded,
-                        &activation_orders,
-                        wgpu::LoadOp::Load,
-                    )?;
-                }
-                crate::SceneDrawableKind::Vector => {
-                    let (target, encoder) = self.target_and_encoder(&encoded)?;
-                    vector_pipeline.encode_prepared_activations(
-                        encoder,
-                        &target.view,
-                        &vectors,
-                        &activation_orders,
-                        wgpu::LoadOp::Load,
-                    )?;
-                }
-            }
-            start = end;
+        {
+            let renderer = &*self.renderer;
+            let target = &renderer.slots[encoded.slot_index].target.view;
+            let encoder = self
+                .encoder
+                .as_mut()
+                .expect("submission retains its encoder until submit");
+            encode_scene_entries(
+                renderer,
+                encoder,
+                &encoded,
+                vector_pipeline,
+                &vectors,
+                &batch.display_order,
+                target,
+                wgpu::LoadOp::Load,
+            )?;
         }
         Ok(encoded)
     }
@@ -2350,6 +2416,115 @@ fn validate_temporal_color_budget(
             "temporal color targets require {bytes} bytes; limit is {}",
             SpritePipeline::MAX_TEMPORAL_COLOR_BYTES
         )));
+    }
+    Ok(())
+}
+
+fn validate_scene_display_order(batch: &crate::TemporalSceneBatch) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    let mut display_sprites = BTreeSet::new();
+    let mut display_vectors = BTreeSet::new();
+    for entry in &batch.display_order {
+        if !seen.insert((entry.activation_order, entry.kind)) {
+            return Err(Error::Invalid(
+                "heterogeneous scene display order repeats a drawable identity".to_owned(),
+            ));
+        }
+        match entry.kind {
+            crate::SceneDrawableKind::Sprite => {
+                display_sprites.insert(entry.activation_order);
+            }
+            crate::SceneDrawableKind::Vector => {
+                display_vectors.insert(entry.activation_order);
+            }
+        }
+    }
+    if display_sprites != batch.sprites.slot_activations.iter().copied().collect()
+        || display_vectors != batch.vectors.slot_activations.iter().copied().collect()
+    {
+        return Err(Error::Invalid(
+            "heterogeneous scene display order does not cover its packed drawables".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn partition_scene_display_order(
+    entries: &[crate::SceneDisplayEntry],
+    lighting_layer_order: Option<u32>,
+) -> Result<(
+    &[crate::SceneDisplayEntry],
+    &[crate::SceneDisplayEntry],
+    &[crate::SceneDisplayEntry],
+)> {
+    if entries
+        .windows(2)
+        .any(|pair| pair[0].layer_order > pair[1].layer_order)
+    {
+        return Err(Error::Invalid(
+            "heterogeneous scene display layers are out of order".to_owned(),
+        ));
+    }
+    let Some(lighting_layer_order) = lighting_layer_order else {
+        return Ok((entries, &[], &[]));
+    };
+    let lighting_start = entries.partition_point(|entry| entry.layer_order < lighting_layer_order);
+    let lighting_end = entries.partition_point(|entry| entry.layer_order <= lighting_layer_order);
+    Ok((
+        &entries[..lighting_start],
+        &entries[lighting_start..lighting_end],
+        &entries[lighting_end..],
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_scene_entries(
+    renderer: &TemporalSpriteRenderer,
+    encoder: &mut wgpu::CommandEncoder,
+    encoded: &EncodedTemporalBatch,
+    vector_pipeline: &crate::VectorPipeline,
+    vectors: &crate::vector_gpu::EncodedTemporalVectorBatch,
+    entries: &[crate::SceneDisplayEntry],
+    target: &wgpu::TextureView,
+    mut load: wgpu::LoadOp<wgpu::Color>,
+) -> Result<()> {
+    let mut start = 0;
+    while start < entries.len() {
+        let kind = entries[start].kind;
+        let mut end = start + 1;
+        while end < entries.len() && entries[end].kind == kind {
+            end += 1;
+        }
+        let activation_orders = entries[start..end]
+            .iter()
+            .map(|entry| entry.activation_order)
+            .collect::<Vec<_>>();
+        match kind {
+            crate::SceneDrawableKind::Sprite => {
+                let runs = activation_orders
+                    .iter()
+                    .map(|activation_order| sprite_activation_run(encoded, *activation_order))
+                    .collect::<Result<Vec<_>>>()?;
+                renderer.encode_runs_into_slot(
+                    encoder,
+                    encoded.slot_index,
+                    Some(target),
+                    runs.into_iter(),
+                    load,
+                )?;
+            }
+            crate::SceneDrawableKind::Vector => {
+                vector_pipeline.encode_prepared_activations(
+                    encoder,
+                    target,
+                    vectors,
+                    &activation_orders,
+                    load,
+                )?;
+            }
+        }
+        load = wgpu::LoadOp::Load;
+        start = end;
     }
     Ok(())
 }
@@ -2590,14 +2765,14 @@ mod tests {
     use std::collections::BTreeMap;
     use std::num::NonZeroU32;
 
-    use crate::{AtlasEntry, TextureAtlas, TextureAtlasPage};
+    use crate::{AtlasEntry, SceneDisplayEntry, SceneDrawableKind, TextureAtlas, TextureAtlasPage};
 
     use super::{
         FrameConfig, PIXI_COLOR_FORMAT, SpriteBlendMode, SpriteDrawRun, SpriteInstance,
         SpritePipeline, additive_blend, atlas_mip_level_count, blur_config_offset,
-        build_atlas_mip_levels, multiply_blend, screen_blend, validate_draw_runs,
-        validate_in_flight_batches, validate_multiview_count, validate_sprite_shader,
-        validate_temporal_color_budget,
+        build_atlas_mip_levels, multiply_blend, partition_scene_display_order, screen_blend,
+        validate_draw_runs, validate_in_flight_batches, validate_multiview_count,
+        validate_sprite_shader, validate_temporal_color_budget,
     };
 
     #[test]
@@ -2645,6 +2820,28 @@ mod tests {
         assert_eq!(blur_config_offset(0, 2, stride).unwrap(), 512);
         assert_eq!(blur_config_offset(1, 0, stride).unwrap(), 768);
         assert!(blur_config_offset(0, 3, stride).is_err());
+    }
+
+    #[test]
+    fn partitions_scene_around_the_filtered_lighting_layer() {
+        let entry = |activation_order, layer_order| SceneDisplayEntry {
+            activation_order,
+            layer_order,
+            kind: SceneDrawableKind::Sprite,
+        };
+        let entries = [entry(1, 2), entry(2, 3), entry(3, 3), entry(4, 4)];
+        let (before, lighting, after) = partition_scene_display_order(&entries, Some(3)).unwrap();
+        assert_eq!(before, &entries[..1]);
+        assert_eq!(lighting, &entries[1..3]);
+        assert_eq!(after, &entries[3..]);
+
+        let (all, lighting, after) = partition_scene_display_order(&entries, None).unwrap();
+        assert_eq!(all, entries);
+        assert!(lighting.is_empty());
+        assert!(after.is_empty());
+
+        let out_of_order = [entry(1, 3), entry(2, 2)];
+        assert!(partition_scene_display_order(&out_of_order, Some(3)).is_err());
     }
 
     #[test]
