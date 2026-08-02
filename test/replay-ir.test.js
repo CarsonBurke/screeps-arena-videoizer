@@ -197,6 +197,54 @@ test("ReplayIR stores exact calculation tracks across changes and lifetimes", ()
   );
 });
 
+test("ReplayIR losslessly stores non-finite calculation outputs only", () => {
+  const states = [
+    { objects: [{ _id: "one", type: "creep", strict: 1 }] },
+    { objects: [{ _id: "one", type: "creep", strict: 1 }] },
+  ];
+  const replay = compileReplayIR({
+    states,
+    calculationStates: [
+      new Map([["one", {
+        collision: Number.NaN,
+        positive: Number.POSITIVE_INFINITY,
+        nested: {
+          "/": Number.NaN,
+          "0": Number.POSITIVE_INFINITY,
+          "escaped/~": [Number.NEGATIVE_INFINITY],
+        },
+      }]]),
+      new Map([["one", {
+        collision: { $nonFiniteNumber: "NaN" },
+        positive: Number.POSITIVE_INFINITY,
+        nested: {
+          "/": Number.NaN,
+          "0": Number.POSITIVE_INFINITY,
+          "escaped/~": [Number.NEGATIVE_INFINITY],
+        },
+      }]]),
+    ],
+  });
+  const first = reconstructReplayCalculations(replay, 0).get("one");
+  const second = reconstructReplayCalculations(replay, 1).get("one");
+
+  assert.equal(Number.isNaN(first.collision), true);
+  assert.deepEqual(second.collision, { $nonFiniteNumber: "NaN" });
+  assert.equal(first.positive, Number.POSITIVE_INFINITY);
+  assert.equal(first.nested["escaped/~"][0], Number.NEGATIVE_INFINITY);
+  assert.equal(Number.isNaN(first.nested["/"]), true);
+  assert.equal(first.nested["0"], Number.POSITIVE_INFINITY);
+  const loaded = JSON.parse(JSON.stringify(replay));
+  assert.equal(Number.isNaN(reconstructReplayCalculations(loaded, 0).get("one").nested["/"]), true);
+  assert.equal(replay.version, 8);
+  assert.throws(
+    () => compileReplayIR({
+      states: [{ objects: [{ _id: "one", type: "creep", strict: Number.NaN }] }],
+    }),
+    /non-finite/,
+  );
+});
+
 test("ReplayIR calculation tracks require complete active-object coverage", () => {
   const states = [{ objects: [{ _id: "one", type: "creep" }] }];
   assert.throws(

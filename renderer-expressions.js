@@ -4,6 +4,7 @@ const { createRendererAction } = require("./renderer-actions");
 
 const SUPPORTED_EXPRESSION_OPERATORS = Object.freeze([
   "$calc",
+  "$idx",
   "$processorParam",
   "$random",
   "$rel",
@@ -35,6 +36,13 @@ function scaledValue(value, options) {
 const operators = {
   $calc(path, options, stateParams) {
     return scaledValue(resolvePath(stateParams.calcs, path), options);
+  },
+  $idx(parameters) {
+    if (!Array.isArray(parameters) || parameters.length < 2) {
+      throw new TypeError("renderer $idx expects [target, key]");
+    }
+    const [target, key] = parameters;
+    return target === null || target === undefined ? undefined : target[key];
   },
   $processorParam(path, options, stateParams) {
     return scaledValue(resolvePath(stateParams, path), options);

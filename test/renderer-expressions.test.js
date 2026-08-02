@@ -14,6 +14,7 @@ const {
 test("expression support exactly covers the retained official arena inventory", () => {
   assert.deepEqual(SUPPORTED_EXPRESSION_OPERATORS, [
     "$calc",
+    "$idx",
     "$processorParam",
     "$random",
     "$rel",
@@ -45,6 +46,21 @@ test("state, calc, relative, and processor expressions apply defaults and coeffi
   assert.equal(
     evaluateRendererExpression({ $processorParam: "processor.scale" }, params),
     3,
+  );
+  assert.equal(evaluateRendererExpression({
+    $idx: [
+      { attack: 0xf73381, heal: 0x56ce9e },
+      { $state: "bodyPartType" },
+    ],
+  }, { state: { bodyPartType: "heal" } }), 0x56ce9e);
+  assert.equal(evaluateRendererExpression({ $idx: [["A", "B"], 1] }, {}), "B");
+  assert.equal(evaluateRendererExpression({ $idx: [["A", "B"], "01"] }, {}), undefined);
+  assert.equal(evaluateRendererExpression({ $idx: [["A", "B"], "length"] }, {}), 2);
+  assert.equal(evaluateRendererExpression({ $idx: ["AB", 1] }, {}), "B");
+  assert.equal(evaluateRendererExpression({ $idx: [null, "missing"] }, {}), undefined);
+  assert.throws(
+    () => evaluateRendererExpression({ $idx: [{}] }, {}),
+    /\$idx expects \[target, key]/,
   );
 });
 

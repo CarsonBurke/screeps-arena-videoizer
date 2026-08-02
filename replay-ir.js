@@ -3,7 +3,7 @@
 const crypto = require("node:crypto");
 
 const REPLAY_IR_SCHEMA = "screeps-arena-replay-ir";
-const REPLAY_IR_VERSION = 7;
+const REPLAY_IR_VERSION = 8;
 const RENDERER_CONTRACT_SCHEMA = "screeps-arena-renderer-contract";
 const RENDERER_CONTRACT_VERSION = 5;
 const RENDERER_EVENT_OPS = Object.freeze([
@@ -201,6 +201,44 @@ function canonicalizeJSON(value, path = "$", seen = new Set()) {
   return canonicalizeValue(value, "json", path, seen);
 }
 
+function canonicalizeCalculationValue(value, path = "$", seen = new Set()) {
+  const nonFinite = [];
+  const encode = (current, sourcePath, pointer) => {
+    if (typeof current === "number" && !Number.isFinite(current)) {
+      nonFinite.push([pointer, Number.isNaN(current) ? 0 : current < 0 ? -1 : 1]);
+      return null;
+    }
+    if (current === null || typeof current === "string" || typeof current === "boolean"
+      || typeof current === "number") {
+      return Object.is(current, -0) ? 0 : current;
+    }
+    if (current === undefined || typeof current === "function" || typeof current === "bigint") {
+      throw new TypeError(`${sourcePath} contains nested non-JSON ${typeof current}`);
+    }
+    if (!current || typeof current !== "object" || seen.has(current)) {
+      throw new TypeError(`${sourcePath} contains a cyclic or unsupported value`);
+    }
+    seen.add(current);
+    let result;
+    if (Array.isArray(current)) {
+      result = current.map((item, index) => encode(
+        item,
+        `${sourcePath}[${index}]`,
+        `${pointer}/${index}`,
+      ));
+    } else {
+      result = {};
+      for (const key of Object.keys(current).sort()) {
+        const token = key.replaceAll("~", "~0").replaceAll("/", "~1");
+        result[key] = encode(current[key], `${sourcePath}.${key}`, `${pointer}/${token}`);
+      }
+    }
+    seen.delete(current);
+    return result;
+  };
+  return { value: encode(value, path, ""), nonFinite };
+}
+
 function canonicalizeRendererEventValue(value, path = "$", seen = new Set()) {
   return canonicalizeValue(value, "event", path, seen);
 }
@@ -263,8 +301,10 @@ function createTrack() {
     values: [],
     absent: [],
     undefined: [],
+    nonFinite: [],
     lastKind: null,
     lastPrimitive: null,
+    lastNonFinite: null,
   };
 }
 
@@ -307,16 +347,41 @@ function replayValueEqualsCanonical(value, canonical, path, seen = new Set()) {
   return equal;
 }
 
-function appendSegment(track, tick, value, present = true, path = "$") {
+function storedJSONEquals(left, right) {
+  if (Object.is(left, right)) return true;
+  if (!left || !right || typeof left !== "object" || typeof right !== "object"
+    || Array.isArray(left) !== Array.isArray(right)) return false;
+  if (Array.isArray(left)) {
+    return left.length === right.length
+      && left.every((value, index) => storedJSONEquals(value, right[index]));
+  }
+  const keys = Object.keys(left);
+  return keys.length === Object.keys(right).length
+    && keys.every((key) => Object.prototype.hasOwnProperty.call(right, key)
+      && storedJSONEquals(left[key], right[key]));
+}
+
+function nonFiniteEntriesEqual(left, right) {
+  return Array.isArray(left) && Array.isArray(right) && left.length === right.length
+    && left.every((entry, index) => entry[0] === right[index][0] && entry[1] === right[index][1]);
+}
+
+function appendSegment(track, tick, value, present = true, path = "$", allowNonFinite = false) {
   let kind = "absent";
   let primitive = null;
+  let encodedCalculation = null;
   if (present) {
     if (value === undefined) kind = "undefined";
     else if (value === null) kind = "null";
     else if (typeof value === "number") {
-      if (!Number.isFinite(value)) throw new TypeError(`${path} contains a non-finite number`);
-      kind = "number";
-      primitive = Object.is(value, -0) ? 0 : value;
+      if (!Number.isFinite(value)) {
+        if (!allowNonFinite) throw new TypeError(`${path} contains a non-finite number`);
+        kind = "nonFinite";
+        primitive = Number.isNaN(value) ? 0 : value < 0 ? -1 : 1;
+      } else {
+        kind = "number";
+        primitive = Object.is(value, -0) ? 0 : value;
+      }
     } else if (typeof value === "boolean") {
       kind = "boolean";
       primitive = value;
@@ -325,6 +390,7 @@ function appendSegment(track, tick, value, present = true, path = "$") {
       primitive = value;
     } else {
       kind = "complex";
+      if (allowNonFinite) encodedCalculation = canonicalizeCalculationValue(value, path);
     }
   }
   const segmentIndex = track.values.length - 1;
@@ -332,22 +398,31 @@ function appendSegment(track, tick, value, present = true, path = "$") {
     && track.bounds[segmentIndex * 2 + 1] === tick
     && track.lastKind === kind;
   const unchanged = contiguousAndSameKind && (kind === "complex"
-    ? replayValueEqualsCanonical(value, track.values[segmentIndex], path)
+    ? allowNonFinite
+      ? storedJSONEquals(encodedCalculation.value, track.values[segmentIndex])
+        && nonFiniteEntriesEqual(encodedCalculation.nonFinite, track.lastNonFinite)
+      : replayValueEqualsCanonical(value, track.values[segmentIndex], path)
     : Object.is(track.lastPrimitive, primitive));
   if (unchanged) {
     track.bounds[segmentIndex * 2 + 1] = tick + 1;
     return;
   }
+  if (kind === "nonFinite") encodedCalculation = canonicalizeCalculationValue(value, path);
   const storedValue = present && value !== undefined
-    ? deepFreeze(canonicalizeJSON(value, path))
+    ? deepFreeze(allowNonFinite
+      ? (encodedCalculation || canonicalizeCalculationValue(value, path)).value
+      : canonicalizeJSON(value, path))
     : null;
   const nextIndex = track.values.length;
   track.bounds.push(tick, tick + 1);
   track.values.push(storedValue);
   if (!present) track.absent.push(nextIndex);
   if (present && value === undefined) track.undefined.push(nextIndex);
+  const nonFinite = encodedCalculation && encodedCalculation.nonFinite || [];
+  for (const [pointer, code] of nonFinite) track.nonFinite.push([nextIndex, pointer, code]);
   track.lastKind = kind;
   track.lastPrimitive = primitive;
+  track.lastNonFinite = nonFinite;
 }
 
 function finishTrack(track) {
@@ -356,6 +431,7 @@ function finishTrack(track) {
     Object.freeze(track.values),
     Object.freeze(track.absent),
     Object.freeze(track.undefined),
+    Object.freeze(track.nonFinite.map((entry) => Object.freeze(entry))),
   ]);
 }
 
@@ -383,20 +459,24 @@ function extractActionEvents(actionLog, tick, entityId, events) {
   }
 }
 
-function appendObjectTracks(tracks, activeKeys, value, tick, path) {
+function appendObjectTracks(tracks, activeKeys, value, tick, path, allowNonFinite = false) {
   const keys = Object.keys(value);
   const sameKeys = keys.length === activeKeys.length
     && keys.every((key, index) => key === activeKeys[index]);
   if (sameKeys) {
     for (const key of keys) {
-      appendSegment(tracks.get(key), tick, value[key], true, `${path}.${key}`);
+      appendSegment(
+        tracks.get(key), tick, value[key], true, `${path}.${key}`, allowNonFinite,
+      );
     }
     return keys;
   }
   const presentKeys = new Set(keys);
   for (const key of activeKeys) {
     if (!presentKeys.has(key)) {
-      appendSegment(tracks.get(key), tick, undefined, false, `${path}.${key}`);
+      appendSegment(
+        tracks.get(key), tick, undefined, false, `${path}.${key}`, allowNonFinite,
+      );
     }
   }
   for (const key of keys) {
@@ -405,7 +485,7 @@ function appendObjectTracks(tracks, activeKeys, value, tick, path) {
       track = createTrack();
       tracks.set(key, track);
     }
-    appendSegment(track, tick, value[key], true, `${path}.${key}`);
+    appendSegment(track, tick, value[key], true, `${path}.${key}`, allowNonFinite);
   }
   return keys;
 }
@@ -531,6 +611,7 @@ function compileEntityTracks(
           values,
           tick,
           `$.calculationStates[${tick}].${id}`,
+          true,
         );
       }
       extractActionEvents(object.actionLog, tick, id, actionEvents);
@@ -796,6 +877,7 @@ function segmentAt(track, tick) {
     else if (tick >= endTick) low = middle + 1;
     else {
       return {
+        index: middle,
         present: !sortedArrayIncludes(absent, middle),
         value: sortedArrayIncludes(undefinedValues, middle) ? undefined : values[middle],
       };
@@ -857,6 +939,29 @@ function reconstructVisualTick(replay, tick) {
   return segment.value;
 }
 
+function decodeCalculationValue(value, track, segmentIndex) {
+  const encoded = new Map(track[4]
+    .filter(([index]) => index === segmentIndex)
+    .map(([, pointer, code]) => [pointer, code]));
+  const decode = (current, pointer) => {
+    if (encoded.has(pointer)) {
+      if (current !== null) throw new Error("non-finite calculation placeholder is not null");
+      const code = encoded.get(pointer);
+      return code === 0 ? Number.NaN
+        : code === 1 ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY;
+    }
+    if (Array.isArray(current)) {
+      return current.map((child, index) => decode(child, `${pointer}/${index}`));
+    }
+    if (!current || typeof current !== "object") return current;
+    return Object.fromEntries(Object.entries(current).map(([key, child]) => {
+      const token = key.replaceAll("~", "~0").replaceAll("/", "~1");
+      return [key, decode(child, `${pointer}/${token}`)];
+    }));
+  };
+  return decode(value, "");
+}
+
 function reconstructReplayCalculations(replay, tick) {
   validateReplayIR(replay);
   tick = asNonnegativeInteger(tick, "tick");
@@ -870,7 +975,9 @@ function reconstructReplayCalculations(replay, tick) {
     const calculations = {};
     for (const [key, track] of Object.entries(entity.calculations)) {
       const segment = segmentAt(track, tick);
-      if (segment && segment.present) calculations[key] = segment.value;
+      if (segment && segment.present) {
+        calculations[key] = decodeCalculationValue(segment.value, track, segment.index);
+      }
     }
     values.set(entity.id, calculations);
   }
@@ -1097,11 +1204,11 @@ function assertRendererContractSupported(contract, support) {
   return true;
 }
 
-function validateTrack(track, totalTicks, name, requireCoverage = false) {
-  if (!Array.isArray(track) || track.length !== 4) throw new Error(`invalid ${name} track`);
-  const [bounds, values, absent, undefinedValues] = track;
+function validateTrack(track, totalTicks, name, requireCoverage = false, allowNonFinite = false) {
+  if (!Array.isArray(track) || track.length !== 5) throw new Error(`invalid ${name} track`);
+  const [bounds, values, absent, undefinedValues, nonFinite] = track;
   if (!Array.isArray(bounds) || !Array.isArray(values) || !Array.isArray(absent)
-    || !Array.isArray(undefinedValues)
+    || !Array.isArray(undefinedValues) || !Array.isArray(nonFinite)
     || bounds.length !== values.length * 2) {
     throw new Error(`invalid ${name} track columns`);
   }
@@ -1139,6 +1246,55 @@ function validateTrack(track, totalTicks, name, requireCoverage = false) {
     previousUndefined = index;
   }
   for (const value of values) assertStoredJSON(value, name);
+  let previousIndex = -1;
+  let segmentPointers = new Set();
+  for (const entry of nonFinite) {
+    if (!allowNonFinite || !Array.isArray(entry) || entry.length !== 3) {
+      throw new Error(`invalid ${name} non-finite entry`);
+    }
+    const [index, pointer, code] = entry;
+    if (!Number.isSafeInteger(index) || index < 0 || index >= values.length
+      || typeof pointer !== "string" || (pointer !== "" && !pointer.startsWith("/"))
+      || ![-1, 0, 1].includes(code)
+      || index < previousIndex
+      || sortedArrayIncludes(absent, index) || sortedArrayIncludes(undefinedValues, index)) {
+      throw new Error(`invalid ${name} non-finite entry`);
+    }
+    if (index !== previousIndex) segmentPointers = new Set();
+    if (segmentPointers.has(pointer)) throw new Error(`duplicate ${name} non-finite pointer`);
+    segmentPointers.add(pointer);
+    const tokens = pointer === "" ? [] : pointer.slice(1).split("/");
+    if (tokens.some((token) => /~(?:[^01]|$)/.test(token))) {
+      throw new Error(`invalid ${name} non-finite pointer`);
+    }
+    let target = values[index];
+    let found = true;
+    for (const encodedToken of tokens) {
+      const token = encodedToken.replaceAll("~1", "/").replaceAll("~0", "~");
+      if (Array.isArray(target)) {
+        if (!/^(?:0|[1-9]\d*)$/.test(token)) {
+          found = false;
+          break;
+        }
+        const childIndex = Number(token);
+        if (!Number.isSafeInteger(childIndex) || childIndex >= target.length) {
+          found = false;
+          break;
+        }
+        target = target[childIndex];
+      } else if (target && typeof target === "object"
+        && Object.prototype.hasOwnProperty.call(target, token)) {
+        target = target[token];
+      } else {
+        found = false;
+        break;
+      }
+    }
+    if (!found || target !== null) {
+      throw new Error(`invalid ${name} non-finite placeholder`);
+    }
+    previousIndex = index;
+  }
 }
 
 function assertStoredJSON(value, name, seen = new Set()) {
@@ -1250,7 +1406,13 @@ function validateReplayIR(replay, options = {}) {
       validateTrack(track, replay.totalTicks, `entity ${entity.id}.${key}`);
     }
     for (const [key, track] of Object.entries(entity.calculations)) {
-      validateTrack(track, replay.totalTicks, `entity ${entity.id} calculation ${key}`);
+      validateTrack(
+        track,
+        replay.totalTicks,
+        `entity ${entity.id} calculation ${key}`,
+        false,
+        true,
+      );
     }
     if (!replay.calculationOutputs.enabled
       && Object.keys(entity.calculations).length > 0) {
