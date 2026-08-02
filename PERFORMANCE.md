@@ -138,7 +138,7 @@ representation took 6.74 s, occupied 134.5 MiB, and grew RSS by roughly
 removed that duplication. This is still JavaScript/compiler performance, not
 video rendering throughput.
 
-The native renderer frontend now strictly loads canonical ReplayIR v7 artifacts,
+The native renderer frontend now strictly loads canonical ReplayIR v8 artifacts,
 verifies both SHA-256 fingerprints, validates every track/lifetime/event index,
 recomputes the metadata semantic inventory, and builds an entity index. It
 structurally compiles all 17 retained processor kinds and 14 nested action kinds,
@@ -231,7 +231,7 @@ clock, and later geometry rebuilds derive phase from exact apply-tick time
 (tick one is installed at time zero). Fill and visible-stroke contributions
 remain linear through bilinear and mip filtering. The native GPU implementation
 now uploads deduplicated coverage with full mip chains, builds atlas-safe
-wrapped color mips in one pass, compiles 2–6-view ordered terrain draws, bakes
+wrapped color mips in one pass, compiles 2–8-view ordered terrain draws, bakes
 wall paint/noise into fixed-size mipless RGBA8 layers, and precomputes the exact
 four-horizontal plus four-vertical five-tap blur with RGBA8 quantization and
 the filter pool's asymmetric power-of-two edge sampling. The resident banks
@@ -255,7 +255,7 @@ The native GPU boundary now includes a statically validated wgpu 27 shader and
 host layouts for temporal multiview sprite drawing. It uploads premultiplied
 atlas bytes as an RGBA8 UNORM 2D texture array to preserve the bundled Pixi
 WebGL renderer's byte-space filtering and blending, bounds multiview counts to
-the portable 2–6 range, and caps the in-flight ring at three batches. Each ring
+the configured 2–8 range, and caps the in-flight ring at three batches. Each ring
 slot owns its instance/uniform buffers and RGBA texture-array target, and an
 owning submission context leases a slot once before submitting the command
 buffer. This prevents multiple recorded passes from observing the last queued
@@ -269,7 +269,7 @@ blur. Each view reads its independently animated filter strength. The display
 object's blend mode applies while rendering the filter input; Pixi's normal
 filter state applies on the final pass directly into the scene, avoiding an
 extra RGBA8 roundtrip. The three main ring targets plus shared scratch are
-bounded together by a 512 MiB allocation limit. In addition to static tests,
+bounded together by a 1 GiB allocation limit. In addition to static tests,
 the NVIDIA Vulkan smoke path creates these pipelines and submits an empty black
 frame, a filtered screen-blended white sprite, and one shared temporal scene
 whose overlapping red sprite, green vector, and blue sprite prove cross-kind
@@ -284,7 +284,7 @@ animated instance state. Filtered vectors use the shared temporal ping/pong
 arrays for the same four-horizontal/four-vertical quality-four blur as sprites.
 The filter-input draw retains the node blend and the final pass uses normal
 Pixi filter blending. The supersample array is counted together with sprite
-targets and shared scratch under the 512 MiB temporal color limit; resident
+targets and shared scratch under the 1 GiB temporal color limit; resident
 geometry plus all vector ring and filter-configuration buffers share a 256 MiB
 allocation ceiling. This is submission plumbing, not yet a throughput
 claim: stateless action-track compilation, device-level multibatch tests,
@@ -299,7 +299,12 @@ created destination. This establishes an encoded-output oracle, but the
 GPU-to-host readback cannot satisfy the final latency target. Readback creation
 checks the device buffer limit, requires portable multiview support, and uses
 exclusive mutable access across copy/map/unmap. FFmpeg input writes have a
-deadline so a stalled encoder cannot hang the renderer indefinitely.
+deadline so a stalled encoder cannot hang the renderer indefinitely. For widths
+that already satisfy the 256-byte copy-row alignment (including 2048), the
+mapped readback visitor now lends each complete frame directly to the sink:
+there is no per-frame allocation or second host copy. Padded widths reuse one
+fully overwritten scratch frame. An unmap guard covers success, visitor error,
+mapping failure, and panic unwinding.
 
 The initial native draw-node adapters cover root containers, generic
 `container` and `sprite` processors, deterministic supersampled premultiplied
@@ -435,3 +440,143 @@ resident geometry with six vertices. The AMD RADV path remains an independently
 validated fallback. This validates live pipeline creation, heterogeneous
 submission order, resident geometry reuse, conversion, and readback; it is not
 yet an end-to-end throughput benchmark.
+
+The release `gpu-throughput` probe now exercises the production multiview
+sprite targets and the GPU-resident BT.709 NV12 conversion boundary at target
+cardinality. On that same RTX 5090, 16,001 2048² frames with 500 visible sprite
+instances per frame completed on the GPU in 0.571 s (28,046 frames/s,
+117.6 RGBA Gpixels/s), after 0.174 s of device/pipeline allocation. It used six
+views per batch, three in-flight batches, and 889 command submissions. This
+excludes replay loading, terrain, vectors, filters, hardware encode, and muxing,
+so it proves raster/conversion capacity rather than end-to-end completion.
+
+For comparison, the installed FFmpeg/NVENC path encoded 16,001 synthetic black
+2048² frames in 27.2 s with `h264_nvenc -preset p1 -tune ull -rc constqp -qp
+18`. That measurement includes host-side frame generation and upload and is not
+an encoder-engine-only limit, but it confirms that the existing CPU-fed FFmpeg
+fallback cannot satisfy the strict latency target. Direct GPU-image interop and
+ordered parallel encoder sessions remain necessary.
+
+Parallel encoder probes narrow that constraint further. Eight concurrent
+CPU-fed H.264/NVENC segments covering the same 16,001-frame workload completed
+in 11.96 s; eight AV1/NVENC segments completed in 11.25 s. FFmpeg's
+GPU-resident Vulkan H.264 path encoded 2,281 synthetic 2048² NV12 frames in
+5.185 s at its stable default async depth. Raising the async depth to 16 instead
+aborted inside FFmpeg's Vulkan encoder on this driver, so Vulkan Video is not a
+competitive or sufficiently robust primary path yet.
+Those tests are not a formal hardware lower bound, but they show that removing
+readback/upload alone cannot plausibly bridge the remaining order-of-magnitude
+gap on this machine. The final encoder design therefore needs measured
+encoder-engine concurrency and may require different output constraints or
+additional encoding hardware to meet two seconds.
+
+A direct SDK probe now removes that uncertainty for resident inputs. It uploads
+a bounded 16-frame CUDA NV12 ring once, then times only NVENC submission,
+ordered bitstream draining, and EOS. H.264 High/P1/ultra-low-latency/CQP18 took
+6.840 s for the 2,281-frame 2048² target (333.5 fps) and occupied about one
+third of the reported encoder capacity. The same resident ring encoded valid
+AV1 Main low-overhead OBU in 1.942 s (1,174.5 fps); FFprobe and both FFmpeg and
+dav1d decoded all 2,281 frames. File output versus discard did not materially
+change either result. AV1 therefore crosses the encoder-only two-second line,
+while H.264 cannot do so in one session. The end-to-end path must still import
+the renderer's exportable Vulkan images as CUDA arrays, register them directly,
+overlap conversion with encode, and keep allocation/setup outside the measured
+critical path.
+
+The retained 286-tick CTF reference capture produced 2,281 distinct 2048²
+frames at 30 fps in 12.777 s (178.5 generated fps). ReplayIR v8 compilation was
+263.7 ms, canonical artifact publication was 15.1 ms, and the compatibility
+scheduler/render/encode loop was 10.951 s. The resulting 3.38 MB authenticated
+artifact now passes the native frontend end to end: 83,139 renderer lifecycle
+events resolve into 19,253 activations and 2,574 native scene templates without
+reopening the game client. This is the current
+full-resolution correctness oracle, not a sub-two-second result.
+
+The native `render-replay` command now supplies the missing correctness-driver
+boundary: canonical ReplayIR is resolved into matching temporal scene and
+terrain batches, rendered through the production Vulkan pipelines, converted
+to tightly packed BT.709-limited NV12, streamed into one H.264 encoder, and
+muxed to MP4. A three-frame 64² synthetic ReplayIR completed successfully in
+one six-view batch; FFprobe reported H.264, the exact 64² extent, three frames,
+limited range, and BT.709. A lossless regression decodes the first frame back to
+the exact input NV12 bytes. This also found and fixed missing input-side FFmpeg
+color metadata that previously changed Y/U/V values before encoding.
+
+The driver fails before atlas/GPU/encoder/output setup when active processors
+lack adapters. `creepBuildBody` now lowers to an ordered multicolor mesh followed
+by the renderer's centered 120×120 TOUGH atlas sprite when present, and the nine
+captured body-part labels deduplicate to four zoom-aware Roboto raster assets
+with global-bound pixel snapping. The
+contract-aware decoration path also proves that the oracle's 89 decoration
+activations have no object/creep matches and therefore emit nothing; a future
+matching decoration contract still fails closed. A captured-subset
+`creepActions` adapter now supports all 9,036 runs: 36 first-run no-ops, shared
+persistent cover targets, 1,213 flashes, 27 bites, and 224 crisp/blur shot
+drawables. Unknown live branches still fail closed.
+
+The complete cached CTF then rendered without touching Steam: all 2,281 frames
+at 2048² and 30 fps were muxed into a 76.033-second H.264/BT.709 limited-range
+MP4. The optimized correctness run automatically selected four temporal views
+to remain below the 512 MiB vector-target budget and took 12.232 seconds total
+(1.420 seconds setup, 10.506 seconds render/readback/encode, 217.1 generated
+frames/s). This closes
+the functional full-video gate. Replacing the blocking readback/single FFmpeg
+pipe with measured zero-copy parallel encoding remains the next performance
+gate; the strict sub-two-second target is not yet achieved.
+
+## Direct AV1 full-replay path (2026-08-01)
+
+The production driver now implements that zero-copy boundary. Each eight-frame
+multiview submission converts directly into dedicated exportable packed-NV12
+Vulkan images, which are imported once as CUDA arrays in a bounded AV1/NVENC
+ring. Each CUDA array and NVENC resource registration remains resident for the
+ring lifetime. A slot is mapped for `NvEncEncodePicture`, kept mapped until its
+output bitstream has been locked and copied as required by the SDK, and then
+unmapped before Vulkan reuse.
+FFmpeg only stream-copies the resulting OBU packets into MP4; no rendered pixels
+return to host memory.
+
+The active wgpu Vulkan device exposes external-memory FDs but does not enable
+`VK_KHR_external_semaphore_fd`. The driver therefore host-serializes Vulkan
+completion before NVENC mapping and NVENC completion before Vulkan reuse. This
+is verified on the reference NVIDIA driver, but it is not claimed as a portable
+Vulkan/CUDA visibility contract; constructing wgpu on a device with exported
+semaphore support remains required for that guarantee.
+
+Exact scene optimizations removed the dominant redundant work. The
+vector resolver computes a conservative union of transformed geometry bounds
+across active temporal layers, partially clears the 2× scratch array, and
+scissors unfiltered downsample/composite passes to that union. Static terrain
+lighting is now sampled from its resident cache rather than copied through a
+128 MiB eight-layer compositor target for every batch. Renderer lifecycle
+events defer detached-target collection to the end of each tick, replacing
+thousands of equivalent full-set rebuilds with one. Processor definitions are
+resolved once, and active processor/action scopes use borrowed nested hash
+lookups instead of allocating ordered tuple keys per event.
+
+Two Vulkan submissions now rotate across separate render, upload, lighting, and
+packed-NV12 ring slots; shared scratch accesses remain ordered on the same
+Vulkan queue. Batch N+1 is submitted before the host waits specifically for
+batch N, so N+1 can remain on the GPU while N enters NVENC. The encoder
+keeps a 32-surface input/output ring registered, and FFmpeg packet writes run on
+a bounded worker while preserving access-unit order and atomic MP4 publication.
+
+On the RTX 5090 reference system, the corrected persistent-registration
+baseline at high-quality CQP18 took 3.190 s for render/encode/mux and produced a
+66,667,497-byte MP4. Persistent registration reduced that to about 2.22 s;
+tick-batched lifecycle collection and the two-submission GPU schedule reduced
+it to about 2.05 s without changing the encoded output.
+
+The final AV1 configuration uses NVENC's explicit three-way split-frame mode at
+the same CQP18. NVIDIA documents that split-frame encoding trades some coding
+efficiency for single-session throughput, so the complete decoded result was
+compared against the prior CQP18 oracle: average PSNR was 50.745 dB (minimum
+50.170 dB), and aggregate SSIM was 0.992994. The result contains 66,038,060
+encoded OBU bytes in a 66,041,815-byte AV1 Main MP4 with all 2,281 distinct
+2048² BT.709-limited frames and lasts
+76.033 seconds. The final faststart-enabled run with SDK-required input mappings
+held through bitstream lock measured 1.787 seconds for the render/encode/mux
+critical path (1,276.4 generated frames/s), plus 1.155 seconds of one-time
+process/device/cache setup. The strict sub-two-second critical-path target is
+therefore achieved at full resolution, animation cardinality, and the default
+high-quality CQP18 setting.

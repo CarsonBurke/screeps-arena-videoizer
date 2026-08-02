@@ -77,9 +77,17 @@ Useful framing and operational settings:
 BOARD_ZOOM=auto BOARD_PADDING=32 BOARD_PAN_X=0 BOARD_PAN_Y=0
 PRELOAD_CONCURRENCY=4 COMPILER_UNIT_TICKS=50 REPLAY_IR=1
 CAPTURE_TIMEOUT=1800
+CLOSE_APP_AFTER_CAPTURE=0
 RENDER_DISPLAY=:0
 EXTRA_FLAGS="..."
 ```
+
+Live-display captures keep the Screeps app and Steam session open by default.
+The next invocation sends its replay URL through Electron's existing
+single-instance deep-link handler, so repeated captures do not close and
+relaunch Steam. Set `CLOSE_APP_AFTER_CAPTURE=1` only for an explicitly one-shot
+session. Headless captures always close their app because its private Xvfb
+display is removed at the end of the run.
 
 `BOARD_ZOOM=auto` is the safe default: it contains the complete 100×100 map at
 any square, landscape, or portrait output size. A numeric zoom is an explicit
@@ -93,7 +101,7 @@ once. `COMPILER_UNIT_TICKS` defines exact 50-tick ReplayIR planning/ownership
 boundaries; it does not make Pixi faster. The present compatibility renderer
 still consumes states and frames sequentially because its live action graph is
 stateful, and telemetry reports that explicitly. The native temporal backend in
-[PERFORMANCE.md](PERFORMANCE.md) uses portable 2–6-view wgpu multiview passes,
+[PERFORMANCE.md](PERFORMANCE.md) uses bounded 2–8-view wgpu multiview passes,
 with larger frame units split across those bounded batches.
 
 `REPLAY_IR=1` additionally retains a lossless, content-addressed ReplayIR and
@@ -116,7 +124,7 @@ a visual semantic or renderer implementation it has not implemented, or a
 modified artifact.
 
 The source tree includes `native-renderer`, a Rust frontend for this boundary.
-It accepts only canonical ReplayIR v7/renderer-contract v5 artifacts, checks
+It accepts only canonical ReplayIR v8/renderer-contract v5 artifacts, checks
 both fingerprints and all structural invariants, and plans independently
 addressable absolute-time frame batches:
 
@@ -143,6 +151,55 @@ in-flight ring slot while confirming that two registrations of the same mesh
 occupy one resident geometry entry.
 `VK_ICD_FILENAMES` can select a particular installed ICD when diagnosing a
 multi-GPU machine.
+
+Measure the full-resolution temporal raster and GPU-resident NV12 boundary
+without launching Steam:
+
+```bash
+cargo run --release --manifest-path native-renderer/Cargo.toml \
+  --bin gpu-throughput -- 2048 2048 16001 500
+```
+
+The arguments are width, height, output-frame count, and sprites per frame.
+This is a renderer/conversion capacity probe, not an end-to-end claim: it does
+not load a replay, render every dedicated processor, or encode/mux a video.
+
+Render a supported ReplayIR through the real native scene + terrain + Vulkan
+multiview + NV12 + FFmpeg path with:
+
+```bash
+cargo run --release --manifest-path native-renderer/Cargo.toml \
+  --bin render-replay -- \
+  /path/to/capture.replay-ir.json out/native.mp4 --overwrite
+```
+
+The default path is AV1 Main through direct Vulkan external-memory → CUDA-array
+→ NVENC interop; add `--h264` for the host-readback `h264_nvenc` fallback,
+`--software` for `libx264`, or use `-` as the artifact path to stream canonical
+ReplayIR on stdin. The command checks
+processor support before building the atlas, opening FFmpeg, or creating an
+output. The saved CTF oracle now lowers `creepBuildBody` into retained vector
+meshes, rasterizes its four unique one-character Roboto labels at the captured
+stage zoom, proves its landscape-only contract makes both decoration processors
+zero-output, and reproduces the captured `creepActions` attack, heal, flash,
+bite, and ranged-shot effects with persistent shared targets. Contracts
+containing object/creep decorations, text outside the body-label shape, or live
+`creepActions` branches outside the authenticated capture subset still fail
+closed. The full saved CTF now renders without launching or restarting Steam.
+The direct path converts each multiview layer into an exportable packed-NV12
+Vulkan image and imports the bounded image ring once. Each slot is registered
+once, mapped for its NVENC submission, and unmapped after its bitstream has been
+locked and copied; Vulkan does not reuse the slot until that output is complete. Two
+ring-slot-isolated Vulkan submissions overlap rendering/conversion with NVENC;
+shared scratch remains safe through same-queue ordering. A
+bounded worker stream-copies ordered AV1 OBU packets into an atomically
+published MP4. On the reference RTX 5090, explicit three-way AV1 split-frame
+encoding at the default high-quality CQP18 completes the full 2,281-frame
+2048² render/encode/mux path in 1.787 seconds with the SDK-required input-map
+lifetime. Decoded comparison against the
+prior CQP18 oracle measured 50.745 dB average PSNR and 0.992994 aggregate SSIM.
+The H.264 and software modes retain the tightly packed BT.709-limited
+host-readback path as a correctness fallback.
 
 The command accepts a file path or `-` for a streamed artifact. It reports the
 validated workload, compiles the 17 retained processor kinds and all 14 nested
@@ -189,10 +246,14 @@ so callers must partition unusually diverse replays into geometry windows
 instead of silently allocating multi-gigabyte texture arrays. Empty banks use
 1×1 physical placeholders. Terrain command buffers use disjoint one-shot
 upload ranges and ordered buffer copies, so several recorded phases cannot
-alias the final queued instance data. Full replay device orchestration,
-wall-graffiti decorations, and representative pixel-golden validation remain.
+alias the final queued instance data. The native output driver now assembles
+these resident banks with matching temporal scene frames, applies the captured
+background clear, converts only the active array layers to NV12, and feeds them
+to the direct AV1/NVENC path by default. Dynamic object/creep decorations,
+uncaptured `creepActions` branches, portable Vulkan/CUDA external-semaphore
+synchronization, and representative Pixi/native pixel goldens remain.
 The native crate also contains a bounded
-wgpu multiview sprite path that renders two to six independent timestamps into
+wgpu multiview sprite path that renders two to eight independent timestamps into
 a texture array in one pass from Pixi-style top-left pixel coordinates. It
 preserves Pixi's RGBA8 UNORM color arithmetic and supports ordered normal,
 additive, multiply, and screen blend runs. Draw runs retain their metadata-layer
@@ -216,7 +277,7 @@ five-tap passes using independently animated strengths in every view. The
 sprite's blend mode is applied when its filter input is rendered and the last
 filter pass blends directly into the scene with Pixi's normal filter state,
 avoiding an extra RGBA8 quantization. Main targets plus blur scratch are capped
-at 512 MiB. Tessellated draw and site-progress vectors share the same temporal
+at 1 GiB. Tessellated draw and site-progress vectors share the same temporal
 target and heterogeneous activation order as sprites. Their immutable
 content-addressed meshes are deduplicated in one resident vertex bank, while
 preallocated ring slots receive only animated instance values per microbatch.
@@ -255,16 +316,19 @@ preventing later uploads from changing earlier recorded passes. A leased
 terrain-scene submission now records terrain and wall foreground phases, the
 heterogeneous sprite/vector scene, the per-slot lighting intermediate and
 multiply composite, and final terrain effects into one ring target before NV12
-conversion. Remaining dedicated processor lowering, the replay output driver
-and visual overlays,
-object-local Pixi filter-frame edge parity,
-pixel-golden validation, final compositor wiring, and GPU-resident
-hardware-encoder interop remain under development, so the command does not
-produce a video yet.
+conversion. The replay output driver now produces a complete MP4 for the saved
+CTF capture, including terrain, vectors, sprites, body labels, TOUGH parts, and
+the authenticated `creepActions` subset. Unknown future processor/action
+branches still fail closed. Owner visual overlays, object-local Pixi
+filter-frame edge parity, and broader pixel-golden coverage remain under
+development.
 The native library now includes a multiview RGBA8-to-BT.709 NV12 conversion
 pass, bounded aligned readback, and a long-lived FFmpeg H.264 sink with exact
 frame-size validation, color metadata, bounded pipe writes, failure capture,
 and atomic publication.
+At naturally aligned widths, mapped NV12 frames are lent directly to that sink
+without allocating or repacking one `Vec` per frame; padded widths reuse a
+single scratch frame.
 That readback path is a validation/fallback oracle; it is not presented as the
 final throughput path because host transfer alone exceeds the target budget.
 
@@ -315,8 +379,8 @@ truncated file.
 
 Telemetry separates state fetching/application, action/ticker updates, Pixi
 rendering, `VideoFrame` creation, encoder backpressure, and flush time. The
-capture configuration is also embedded in the replay URL so a pre-existing Steam
-process cannot reuse stale environment settings.
+capture configuration is also embedded in the replay URL so a reused app
+instance cannot retain stale environment settings.
 
 The current raw-H.264 remux is constant-frame-rate. If a replay endpoint falls
 between frame-grid points, the renderer still samples that exact endpoint, but
