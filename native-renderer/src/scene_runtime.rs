@@ -1403,10 +1403,12 @@ fn merge_temporal_display_order(views: &[&[SceneDisplayEntry]]) -> Result<Vec<Sc
 
     let mut ready = indegrees
         .iter()
-        .filter_map(|(identity, indegree)| (*indegree == 0).then_some(*identity))
+        .filter_map(|(identity, indegree)| {
+            (*indegree == 0).then_some((identities[identity].layer_order, *identity))
+        })
         .collect::<BTreeSet<_>>();
     let mut output = Vec::with_capacity(identities.len());
-    while let Some(identity) = ready.pop_first() {
+    while let Some((_, identity)) = ready.pop_first() {
         output.push(identities[&identity]);
         for after in &edges[&identity] {
             let indegree = indegrees
@@ -1414,7 +1416,7 @@ fn merge_temporal_display_order(views: &[&[SceneDisplayEntry]]) -> Result<Vec<Sc
                 .expect("edge target has an indegree");
             *indegree -= 1;
             if *indegree == 0 {
-                ready.insert(*after);
+                ready.insert((identities[after].layer_order, *after));
             }
         }
     }
@@ -1544,6 +1546,25 @@ mod tests {
 
         let reversed = [sprite_b, vector, sprite_a];
         assert!(merge_temporal_display_order(&[&first, &reversed]).is_err());
+
+        let early_activation_late_layer = SceneDisplayEntry {
+            activation_order: 4,
+            layer_order: 2,
+            kind: SceneDrawableKind::Sprite,
+        };
+        let late_activation_early_layer = SceneDisplayEntry {
+            activation_order: 5,
+            layer_order: 1,
+            kind: SceneDrawableKind::Sprite,
+        };
+        assert_eq!(
+            merge_temporal_display_order(&[
+                &[early_activation_late_layer],
+                &[late_activation_early_layer],
+            ])
+            .unwrap(),
+            [late_activation_early_layer, early_activation_late_layer],
+        );
     }
 
     fn unit_atlas() -> TextureAtlas {
