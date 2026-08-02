@@ -116,7 +116,7 @@ test("resolveCaptureTransport uses private cache paths for valid capture-id", ()
   );
   assert.equal(outsideEnv.errorFile, path.join(root, "capture-42.error"));
 
-  const insideEnv = resolveCaptureTransport(
+  const staleInsideEnv = resolveCaptureTransport(
     {},
     new URLSearchParams("capture-id=capture-42"),
     {
@@ -124,7 +124,7 @@ test("resolveCaptureTransport uses private cache paths for valid capture-id", ()
       SCREEPS_ARENA_BOARD_CAPTURE_ERROR: path.join(root, "custom.error"),
     },
   );
-  assert.equal(insideEnv.errorFile, path.join(root, "custom.error"));
+  assert.equal(staleInsideEnv.errorFile, path.join(root, "capture-42.error"));
 });
 
 test("loadVisualStates keeps endpoints empty and loads intermediate ticks once", async () => {

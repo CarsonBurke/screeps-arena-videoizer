@@ -7,8 +7,62 @@ const test = require("node:test");
 const {
   chooseEncoderConfig,
   createEncoderGate,
+  createFifoFdWriter,
   createFifoWriter,
+  openFifoForWrite,
 } = require("../capture-transport");
+
+test("openFifoForWrite returns its bounded nonblocking probe descriptor", async () => {
+  const opens = [];
+  const closes = [];
+  const fileSystem = {
+    constants: { O_WRONLY: 1, O_NONBLOCK: 2 },
+    open(path, flags, callback) {
+      opens.push([path, flags]);
+      queueMicrotask(() => callback(null, 10));
+    },
+    close(fd, callback) {
+      closes.push(fd);
+      queueMicrotask(() => callback(null));
+    },
+  };
+
+  const fd = await openFifoForWrite("/private/capture.fifo", 100, 1, fileSystem);
+  assert.equal(fd, 10);
+  assert.deepEqual(opens, [["/private/capture.fifo", 3]]);
+  assert.deepEqual(closes, []);
+});
+
+test("createFifoFdWriter retries EAGAIN and completes partial writes", async () => {
+  const writes = [];
+  const closes = [];
+  let call = 0;
+  const fileSystem = {
+    write(fd, buffer, offset, length, position, callback) {
+      writes.push({ fd, buffer: buffer.toString(), offset, length, position });
+      call++;
+      queueMicrotask(() => {
+        if (call === 1) callback(Object.assign(new Error("full"), { code: "EAGAIN" }));
+        else callback(null, call === 2 ? 2 : length);
+      });
+    },
+    close(fd, callback) {
+      closes.push(fd);
+      queueMicrotask(() => callback(null));
+    },
+  };
+  const writer = createFifoFdWriter(12, fileSystem, 0);
+  writer.enqueue(Buffer.from("abcd"));
+  await writer.finish();
+  assert.deepEqual(writes.map(({ offset, length }) => [offset, length]), [
+    [0, 4],
+    [0, 4],
+    [2, 2],
+  ]);
+  assert.equal(writer.writtenBytes, 4);
+  assert.equal(writer.pendingBytes, 0);
+  assert.deepEqual(closes, [12]);
+});
 
 test("createEncoderGate does not lose a dequeue that races waitForCapacity", async () => {
   const listeners = new Set();

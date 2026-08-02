@@ -412,6 +412,10 @@ function patchMain() {
     var options = Number.isSafeInteger(totalTicks) && totalTicks >= 0
       ? { totalTicks: totalTicks }
       : {};
+    var captureParams = new URLSearchParams(
+      location.hash.split('?')[1] || location.search || ''
+    );
+    options.closeWindow = captureParams.get('capture-close-window') === '1';
     require(runtimePath).captureBoard(this, options);
   }
 

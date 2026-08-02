@@ -23,7 +23,7 @@ const {
 const {
   chooseEncoderConfig,
   createEncoderGate,
-  createFifoWriter,
+  createFifoFdWriter,
   openFifoForWrite,
   resolveCaptureTransport,
 } = require("./capture-transport");
@@ -512,16 +512,13 @@ async function captureBoard(component, options = {}) {
 
   let telemetry;
   let telemetryFile;
-  let stream;
   let writer;
   let encoder;
   let encoderGate;
-  let wakeEncoderOnStreamError;
   let clockControl;
   let visualLayer;
   let stateSnapshot;
   let originalRandom;
-  let captureError = null;
   const captureStart = nowMs();
 
   try {
@@ -991,8 +988,9 @@ async function captureBoard(component, options = {}) {
         "fifoOpenTimeoutMs",
       ),
     );
-    stream = fs.createWriteStream(fifoPath, { fd: fifoFd, autoClose: true });
-    writer = createFifoWriter(stream);
+    writer = createFifoFdWriter(fifoFd, fs, 1, () => {
+      if (encoderGate) encoderGate.wake();
+    });
     telemetry.timingsMs.fifoOpen = nowMs() - mark;
 
     let encoderError = null;
@@ -1019,10 +1017,6 @@ async function captureBoard(component, options = {}) {
       },
     });
     encoderGate = createEncoderGate(encoder, () => encoderError || writer.error);
-    // A stream failure must also release a producer blocked on the encoder
-    // queue; the writer's own wake-up only covers FIFO waiters.
-    wakeEncoderOnStreamError = () => encoderGate && encoderGate.wake();
-    stream.on("error", wakeEncoderOnStreamError);
     encoder.configure(encoderConfig);
 
     const renderFrame = options.renderFrame || (() => renderer.render(stage));
@@ -1245,14 +1239,13 @@ async function captureBoard(component, options = {}) {
     log("capture-complete", telemetry);
     if (doneFile) fs.writeFileSync(doneFile, "");
 
-    if (options.closeWindow !== false) {
+    if (options.closeWindow === true) {
       try {
         if (typeof window !== "undefined" && typeof window.close === "function") window.close();
       } catch (_) {}
     }
     return telemetry;
   } catch (error) {
-    captureError = error;
     fail(`board capture error: ${errorText(error)}`);
     if (telemetry) {
       telemetry.error = errorText(error);
@@ -1261,7 +1254,7 @@ async function captureBoard(component, options = {}) {
       writeTelemetry(telemetryFile, telemetry);
     }
     log("capture-failed", { error: errorText(error) });
-    if (options.closeWindow !== false) {
+    if (options.closeWindow === true) {
       try {
         if (typeof window !== "undefined" && typeof window.close === "function") window.close();
       } catch (_) {}
@@ -1270,17 +1263,11 @@ async function captureBoard(component, options = {}) {
     return telemetry || { ok: false, error: errorText(error) };
   } finally {
     if (encoderGate) encoderGate.destroy();
-    if (stream && wakeEncoderOnStreamError) {
-      stream.removeListener("error", wakeEncoderOnStreamError);
-    }
     if (encoder) {
       try { encoder.reset(); } catch (_) {}
       try { encoder.close(); } catch (_) {}
     }
     if (writer) writer.destroy();
-    if (stream && !stream.destroyed && captureError) {
-      try { stream.destroy(); } catch (_) {}
-    }
     if (clockControl) clockControl.restore();
     if (visualLayer) visualLayer.destroy();
     if (originalRandom) Math.random = originalRandom;
@@ -1309,7 +1296,8 @@ async function captureBoard(component, options = {}) {
           }
         }
       } catch (_) {
-        // Best effort only; successful captures normally close the window.
+        // Best effort only; a live capture window is normally reused for the
+        // next replay URL, while one-shot callers may still close it.
       }
     }
   }

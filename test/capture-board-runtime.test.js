@@ -484,8 +484,11 @@ test("captureBoard drives ticks and frames exactly without implicit animation", 
     ticks$: { getValue() { return 2; } },
   };
   const originalPixi = globalThis.PIXI;
+  const originalWindow = globalThis.window;
   const originalRandom = Math.random;
   let capturedReplayIR;
+  let closedWindows = 0;
+  globalThis.window = { close() { closedWindows++; } };
   globalThis.PIXI = {
     Texture: {
       from() { return { baseTexture: { update() {} } }; },
@@ -496,7 +499,11 @@ test("captureBoard drives ticks and frames exactly without implicit animation", 
       destroy() {}
     },
   };
-  t.after(() => { globalThis.PIXI = originalPixi; });
+  t.after(() => {
+    globalThis.PIXI = originalPixi;
+    if (originalWindow === undefined) delete globalThis.window;
+    else globalThis.window = originalWindow;
+  });
 
   const telemetry = await captureBoard(component, {
     fifoPath,
@@ -520,11 +527,11 @@ test("captureBoard drives ticks and frames exactly without implicit animation", 
     rendererVersion: "1.6.8-arena",
     replayIRFile: path.join(tempDir, "capture.replay-ir.json"),
     onReplayIR(value) { capturedReplayIR = value; },
-    closeWindow: false,
     throwOnError: true,
   });
 
   assert.equal(telemetry.ok, true);
+  assert.equal(closedWindows, 0);
   assert.deepEqual(appliedTicks, [0, 1, 2]);
   assert.equal(explicitRenders, 5);
   assert.equal(visualRenders, 5);

@@ -8,8 +8,8 @@ const fs = require("fs");
  * backpressure without Pixi.
  */
 
-function openFifoForWrite(fifoPath, timeoutMs, retryMs = 10) {
-  const flags = fs.constants.O_WRONLY | fs.constants.O_NONBLOCK;
+function openFifoForWrite(fifoPath, timeoutMs, retryMs = 10, fileSystem = fs) {
+  const probeFlags = fileSystem.constants.O_WRONLY | fileSystem.constants.O_NONBLOCK;
   return new Promise((resolve, reject) => {
     const deadline = Date.now() + timeoutMs;
     let retryTimer = null;
@@ -17,7 +17,7 @@ function openFifoForWrite(fifoPath, timeoutMs, retryMs = 10) {
 
     const finish = (error, fd) => {
       if (settled) {
-        if (typeof fd === "number") fs.close(fd, () => {});
+        if (typeof fd === "number") fileSystem.close(fd, () => {});
         return;
       }
       settled = true;
@@ -27,8 +27,11 @@ function openFifoForWrite(fifoPath, timeoutMs, retryMs = 10) {
     };
 
     const attempt = () => {
-      fs.open(fifoPath, flags, (error, fd) => {
+      fileSystem.open(fifoPath, probeFlags, (error, fd) => {
         if (!error) {
+          // Retain the nonblocking descriptor. createFifoFdWriter handles
+          // EAGAIN as backpressure, avoiding an uncancellable second blocking
+          // open if the reader disappears after this probe succeeds.
           finish(null, fd);
           return;
         }
@@ -48,6 +51,121 @@ function openFifoForWrite(fifoPath, timeoutMs, retryMs = 10) {
 
     attempt();
   });
+}
+
+function createFifoFdWriter(fd, fileSystem = fs, retryMs = 1, onError = () => {}) {
+  const queue = [];
+  const waiters = new Set();
+  let writing = false;
+  let retryTimer = null;
+  let ended = false;
+  let closed = false;
+  let error = null;
+  let pendingBytes = 0;
+  let writtenBytes = 0;
+
+  const wake = () => {
+    for (const resolve of waiters) resolve();
+    waiters.clear();
+  };
+  const fail = (writeError) => {
+    if (error) return;
+    error = writeError;
+    try { onError(writeError); } catch (_) {}
+    wake();
+  };
+  const close = () => new Promise((resolve, reject) => {
+    if (closed) {
+      resolve();
+      return;
+    }
+    closed = true;
+    fileSystem.close(fd, (closeError) => {
+      if (closeError) reject(closeError);
+      else resolve();
+    });
+  });
+  const pump = () => {
+    retryTimer = null;
+    if (writing || ended || error || closed) return;
+    const entry = queue[0];
+    if (!entry) {
+      wake();
+      return;
+    }
+    writing = true;
+    fileSystem.write(
+      fd,
+      entry.buffer,
+      entry.offset,
+      entry.buffer.length - entry.offset,
+      null,
+      (writeError, bytesWritten) => {
+        writing = false;
+        if (writeError && (writeError.code === "EAGAIN" || writeError.code === "EWOULDBLOCK")) {
+          retryTimer = setTimeout(pump, retryMs);
+          return;
+        }
+        if (writeError) {
+          fail(writeError);
+          return;
+        }
+        const remaining = entry.buffer.length - entry.offset;
+        if (!Number.isSafeInteger(bytesWritten)
+          || bytesWritten <= 0
+          || bytesWritten > remaining) {
+          fail(new Error("board capture: FIFO write completed without progress"));
+          return;
+        }
+        entry.offset += bytesWritten;
+        pendingBytes -= bytesWritten;
+        writtenBytes += bytesWritten;
+        if (entry.offset === entry.buffer.length) queue.shift();
+        pump();
+        wake();
+      },
+    );
+  };
+
+  return {
+    enqueue(buffer) {
+      if (ended || closed) throw new Error("board capture: attempted to write after FIFO end");
+      if (error) throw error;
+      if (buffer.length === 0) return;
+      queue.push({ buffer, offset: 0 });
+      pendingBytes += buffer.length;
+      pump();
+    },
+    async waitWritable() {
+      while (true) {
+        if (error) throw error;
+        if (!writing && retryTimer === null && queue.length === 0) return;
+        await new Promise((resolve) => {
+          waiters.add(resolve);
+          if (error || (!writing && retryTimer === null && queue.length === 0)) resolve();
+        });
+      }
+    },
+    async finish() {
+      await this.waitWritable();
+      ended = true;
+      await close();
+      if (error) throw error;
+    },
+    destroy() {
+      ended = true;
+      if (retryTimer !== null) clearTimeout(retryTimer);
+      retryTimer = null;
+      wake();
+      if (!closed) {
+        closed = true;
+        fileSystem.close(fd, () => {});
+      }
+    },
+    get error() { return error; },
+    get pendingBytes() { return pendingBytes; },
+    get writtenBytes() { return writtenBytes; },
+  };
 }
 
 function createEncoderGate(encoder, getError) {
@@ -228,8 +346,8 @@ async function chooseEncoderConfig(VideoEncoderClass, config) {
  * - Otherwise require a valid capture-id and a private cache root under HOME
  *   (or options.transportDir).
  * - Never fall back to fixed shared /tmp names (symlink clobber risk).
- * - Env path overrides are accepted only when they resolve under the private
- *   transport directory for this capture-id.
+ * - A valid URL capture-id is authoritative over inherited process env paths,
+ *   which can belong to an earlier second-instance capture.
  */
 function resolveCaptureTransport(options = {}, params = new URLSearchParams(), env = {}) {
   const rawCaptureId = params.get("capture-id");
@@ -242,22 +360,9 @@ function resolveCaptureTransport(options = {}, params = new URLSearchParams(), e
     ? `${transportDir}/${captureId}`
     : null;
 
-  const underTransportRoot = (candidate) => {
-    if (!candidate || !transportDir) return false;
-    const resolvedRoot = pathResolve(transportDir);
-    const resolvedCandidate = pathResolve(candidate);
-    return resolvedCandidate === resolvedRoot
-      || resolvedCandidate.startsWith(`${resolvedRoot}/`);
-  };
-
-  const pickPath = (optionValue, envName, suffix) => {
+  const pickPath = (optionValue, suffix) => {
     if (optionValue) return String(optionValue);
-    if (transportPrefix) {
-      const preferred = `${transportPrefix}${suffix}`;
-      const envValue = env[envName];
-      if (envValue && underTransportRoot(envValue)) return String(envValue);
-      return preferred;
-    }
+    if (transportPrefix) return `${transportPrefix}${suffix}`;
     // Without a capture-id prefix, only explicit options may select paths.
     // Env overrides alone are ignored to avoid arbitrary writes from a poisoned
     // Steam process environment.
@@ -269,29 +374,19 @@ function resolveCaptureTransport(options = {}, params = new URLSearchParams(), e
     captureId,
     transportDir,
     transportPrefix,
-    fifoPath: pickPath(options.fifoPath, "SCREEPS_ARENA_BOARD_CAPTURE_FIFO", ".fifo"),
-    errorFile: pickPath(options.errorFile, "SCREEPS_ARENA_BOARD_CAPTURE_ERROR", ".error"),
-    doneFile: pickPath(options.doneFile, "SCREEPS_ARENA_BOARD_CAPTURE_DONE", ".done"),
-    debugFile: pickPath(options.debugFile, "SCREEPS_ARENA_BOARD_CAPTURE_DEBUG", ".debug.log"),
-    metaFile: pickPath(options.metaFile, "SCREEPS_ARENA_BOARD_CAPTURE_META", ".meta"),
-    telemetryFile: pickPath(
-      options.telemetryFile,
-      "SCREEPS_ARENA_BOARD_CAPTURE_TELEMETRY",
-      ".telemetry.json",
-    ),
+    fifoPath: pickPath(options.fifoPath, ".fifo"),
+    errorFile: pickPath(options.errorFile, ".error"),
+    doneFile: pickPath(options.doneFile, ".done"),
+    debugFile: pickPath(options.debugFile, ".debug.log"),
+    metaFile: pickPath(options.metaFile, ".meta"),
+    telemetryFile: pickPath(options.telemetryFile, ".telemetry.json"),
   });
-}
-
-function pathResolve(value) {
-  // Local helper so this module does not pull path just for security checks in
-  // environments that only need the FIFO writer (still works under Node).
-  const path = require("path");
-  return path.resolve(String(value));
 }
 
 module.exports = {
   chooseEncoderConfig,
   createEncoderGate,
+  createFifoFdWriter,
   createFifoWriter,
   openFifoForWrite,
   resolveCaptureTransport,

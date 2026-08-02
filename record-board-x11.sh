@@ -36,6 +36,7 @@ Environment overrides:
   SIMULATION_FPS=60              # fixed animation/action substep rate
   BITRATE=24000000               # H.264 target bitrate (bits/s)
   CAPTURE_TIMEOUT=1800            # hard cap (seconds) before giving up
+  CLOSE_APP_AFTER_CAPTURE=0       # keep the live Screeps/Steam session reusable
   BOARD_ZOOM=auto BOARD_PADDING=32 BOARD_PAN_X=0 BOARD_PAN_Y=0
   PRELOAD_CONCURRENCY=4           # concurrent replay/visual chunk requests
   COMPILER_UNIT_TICKS=50          # ReplayIR planning boundary; Pixi stays serial
@@ -89,6 +90,7 @@ TICKS_PER_SECOND=${TICKS_PER_SECOND:-}
 SIMULATION_FPS=${SIMULATION_FPS:-60}
 BITRATE=${BITRATE:-24000000}
 CAPTURE_TIMEOUT=${CAPTURE_TIMEOUT:-1800}
+CLOSE_APP_AFTER_CAPTURE=${CLOSE_APP_AFTER_CAPTURE:-0}
 BOARD_ZOOM=${BOARD_ZOOM:-auto}
 BOARD_PADDING=${BOARD_PADDING:-32}
 BOARD_PAN_X=${BOARD_PAN_X:-0}
@@ -100,6 +102,11 @@ REPLAY_IR=${REPLAY_IR:-0}
 RENDER_DISPLAY=${RENDER_DISPLAY:-${DISPLAY:-:0}}
 # Extra Chromium/Electron flags (space-separated), e.g. to enable GPU rendering.
 EXTRA_FLAGS=${EXTRA_FLAGS:-}
+
+if [[ "$CLOSE_APP_AFTER_CAPTURE" != 0 && "$CLOSE_APP_AFTER_CAPTURE" != 1 ]]; then
+  echo "CLOSE_APP_AFTER_CAPTURE must be 0 or 1" >&2
+  exit 1
+fi
 
 if [[ ! -x "$APP" ]]; then
   echo "Screeps Arena executable not found: $APP" >&2
@@ -232,6 +239,7 @@ TARGET=$(append_param "$TARGET" "capture-bitrate=$BITRATE")
 TARGET=$(append_param "$TARGET" "capture-preload-concurrency=$PRELOAD_CONCURRENCY")
 TARGET=$(append_param "$TARGET" "capture-compiler-unit-ticks=$COMPILER_UNIT_TICKS")
 TARGET=$(append_param "$TARGET" "capture-replay-ir=$REPLAY_IR")
+TARGET=$(append_param "$TARGET" "capture-close-window=$CLOSE_APP_AFTER_CAPTURE")
 TARGET=$(append_param "$TARGET" "capture-random-seed=$CAPTURE_RANDOM_SEED_ENCODED")
 if [[ -n "$TICKS_PER_SECOND" ]]; then
   TARGET=$(append_param "$TARGET" "capture-ticks-per-second=$TICKS_PER_SECOND")
@@ -241,10 +249,23 @@ cleanup() {
   if [[ -n "${FFMPEG_PID:-}" ]]; then
     kill "$FFMPEG_PID" >/dev/null 2>&1 || true
   fi
-  if [[ -n "${APP_PID:-}" ]]; then
-    kill "$APP_PID" >/dev/null 2>&1 || true
+  # A live-display app can accept the next replay through Electron's
+  # second-instance deep-link handler. Keep it (and the Steam client that
+  # launched it) alive by default so consecutive captures do not cycle either
+  # process. A headless app cannot outlive its private Xvfb display, and callers
+  # can explicitly request the old one-shot behavior for live captures.
+  if (( HEADLESS || CLOSE_APP_AFTER_CAPTURE )); then
+    if [[ -n "${APP_PID:-}" ]]; then
+      kill "$APP_PID" >/dev/null 2>&1 || true
+    fi
+    if (( CLOSE_APP_AFTER_CAPTURE )); then
+      # A reused Electron process retains its first-launch argv, so its current
+      # capture ID is not a reliable process selector for an explicit close.
+      pkill -f "/ScreepsArena/screeps_arena" >/dev/null 2>&1 || true
+    else
+      pkill -f "/ScreepsArena/screeps_arena.*capture-id=$CAPTURE_ID" >/dev/null 2>&1 || true
+    fi
   fi
-  pkill -f "/ScreepsArena/screeps_arena.*capture-id=$CAPTURE_ID" >/dev/null 2>&1 || true
   if [[ -n "${XVFB_PID:-}" ]]; then
     kill "$XVFB_PID" >/dev/null 2>&1 || true
   fi
@@ -276,8 +297,12 @@ else
   MODE_FLAGS="--disable-renderer-backgrounding --disable-backgrounding-occluded-windows --disable-frame-rate-limit"
 fi
 
+# The launcher must survive this recorder shell exiting. In live-display mode,
+# Electron's single-instance handler receives the next replay URL without
+# restarting either Screeps Arena or Steam; explicit/headless cleanup still
+# terminates the process below when requested.
 DISPLAY="$DISPLAY_ID" \
-  env -u WAYLAND_DISPLAY \
+  nohup env -u WAYLAND_DISPLAY \
   XDG_SESSION_TYPE=x11 \
   SCREEPS_ARENA_DISABLE_DISCORD_RPC=1 \
   SCREEPS_ARENA_BOARD_CAPTURE=1 \
